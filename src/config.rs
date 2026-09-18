@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_URL: &str = "http://127.0.0.1:4059/rpc";
+pub const DEFAULT_URL: &str = "https://v3.factordb.com:4059/rpc";
 pub const DEFAULT_TIMEOUT: f64 = 120.0;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

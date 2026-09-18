@@ -1,3 +1,4 @@
+mod advance;
 mod client;
 mod config;
 mod render;
@@ -450,6 +451,39 @@ enum SeqCmd {
     Of {
         #[arg(help = TARGET_HELP)]
         target: String,
+    },
+    /// Advance an open sequence by factoring its last composite locally with gmp-ecm and reporting the
+    /// factors (a write) [sequence_view + report_factors]
+    #[command(visible_alias = "work")]
+    Advance {
+        #[arg(help = START_HELP)]
+        start: String,
+        #[arg(long = "type", visible_alias = "sequence", default_value = "aliquot", help = TYPE_HELP, value_name = "TYPE", value_parser = parse_seq_type)]
+        kind: u8,
+        /// gmp-ecm processes to run in parallel (default: all CPUs)
+        #[arg(short, long, value_name = "N")]
+        threads: Option<usize>,
+        /// First ECM level: the digit size of the factors searched for (15, 20, 25, to 65)
+        #[arg(long, default_value = "20", value_name = "LEVEL", value_parser = advance::parse_level)]
+        from: u8,
+        /// Last ECM level; the command stops when it is exhausted without a factor
+        #[arg(long, default_value = "40", value_name = "LEVEL", value_parser = advance::parse_level)]
+        to: u8,
+        /// Stop after advancing this many terms (0 = keep going)
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        terms: u64,
+        /// Stop when the composite has more digits than this (0 = no limit)
+        #[arg(long, default_value_t = 0, value_name = "DIGITS")]
+        max_digits: u64,
+        /// The gmp-ecm binary
+        #[arg(long, default_value = "ecm", value_name = "PATH")]
+        ecm: String,
+        /// Progress line while a level runs, every SECS seconds (0 = none)
+        #[arg(long, default_value_t = 60, value_name = "SECS")]
+        heartbeat: u64,
+        /// Print the first factor found instead of reporting it, then stop
+        #[arg(long)]
+        no_submit: bool,
     },
     /// The type codes accepted by --type
     Types,
@@ -1123,6 +1157,29 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             ctx.simple("list_sequences", p)
         }
         SeqCmd::Of { target: t } => ctx.simple("sequence_of", json!({ "target": target(&t)? })),
+        SeqCmd::Advance { start, kind, threads, from, to, terms, max_digits, ecm, heartbeat, no_submit } => {
+            let start = resolve_start(ctx, &start)?;
+            let threads = threads
+                .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+                .max(1);
+            let kind_name = seq_type_catalog().into_iter().find(|(c, _, _)| *c == kind).map(|(_, n, _)| n).unwrap_or_else(|| kind.to_string());
+            advance::run(
+                ctx,
+                &advance::Opts {
+                    start,
+                    kind,
+                    kind_name,
+                    threads,
+                    from,
+                    to,
+                    terms,
+                    max_digits,
+                    ecm,
+                    heartbeat: Duration::from_secs(heartbeat),
+                    submit: !no_submit,
+                },
+            )
+        }
         SeqCmd::Types => {
             print_seq_types();
             Ok(())
