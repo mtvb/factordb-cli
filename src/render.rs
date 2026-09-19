@@ -14,6 +14,7 @@ pub fn render(method: &str, v: &Value) -> String {
         "get_id" => r_get_id(&mut o, v),
         "get_number" => r_number(&mut o, v),
         "get_factors" => r_factors(&mut o, v),
+        "factor_of" => r_factor_of(&mut o, v),
         "primality" => primality_kv(v).write(&mut o, 0),
         "algebraic_factors" => r_algebraic(&mut o, v, 0),
         "get_family" => r_family(&mut o, v),
@@ -93,6 +94,23 @@ fn has(v: &Value, k: &str) -> bool {
 }
 fn arr<'a>(v: &'a Value, k: &str) -> &'a [Value] {
     v.get(k).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
+}
+
+fn str_of(v: &Value, k: &str) -> String {
+    v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Compact "N ago" for a duration in seconds.
+fn ago(secs: u64) -> String {
+    if secs < 90 {
+        format!("{secs}s ago")
+    } else if secs < 5400 {
+        format!("{} min ago", (secs + 30) / 60)
+    } else if secs < 172800 {
+        format!("{} h ago", (secs + 1800) / 3600)
+    } else {
+        format!("{} d ago", (secs + 43200) / 86400)
+    }
 }
 /// Any scalar as display text ("-" for null/absent, yes/no for booleans).
 fn n(v: &Value, k: &str) -> String {
@@ -1010,6 +1028,25 @@ fn r_status(o: &mut String, v: &Value) {
         }
         _ => o.push_str("  (unavailable)\n"),
     }
+    o.push_str("\nimports\n");
+    let imports = arr(v, "import_status");
+    if imports.is_empty() {
+        o.push_str("  (none)\n");
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let rows: Vec<Vec<String>> = imports
+            .iter()
+            .map(|r| {
+                let lr = u(r, "last_run");
+                let when = if lr > 0 { ago(now.saturating_sub(lr)) } else { "-".into() };
+                vec![str_of(r, "name"), when, str_of(r, "detail")]
+            })
+            .collect();
+        table(o, &["source", "last import", "details"], &rows, 2);
+    }
 }
 
 fn r_digit_dist(o: &mut String, v: &Value) {
@@ -1038,6 +1075,19 @@ fn r_factor_tables(o: &mut String, v: &Value) {
         if !rows.is_empty() {
             table(o, &["name", "formula"], &rows, 2);
         }
+    }
+}
+
+fn r_factor_of(o: &mut String, v: &Value) {
+    let rows: Vec<Vec<String>> =
+        arr(v, "parents").iter().map(|r| vec![fid_label(r, "fid"), commas(u(r, "digits")), number_text(r)]).collect();
+    if rows.is_empty() {
+        o.push_str("(not a factor of any stored number)\n");
+    } else {
+        table(o, &["id", "digits", "number"], &rows, 0);
+    }
+    if b(v, "truncated") {
+        o.push_str("(more parents exist; raise --limit)\n");
     }
 }
 

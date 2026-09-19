@@ -101,6 +101,14 @@ enum Cmd {
         #[arg(help = TARGET_HELP)]
         target: String,
     },
+    /// Numbers this one is a direct factor of; climb the divisor chain [factor_of]
+    FactorOf {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Max parents to list
+        #[arg(long, default_value_t = 20)]
+        limit: u64,
+    },
     /// Primality state and certificate metadata [primality]
     Primality {
         #[arg(help = TARGET_HELP)]
@@ -743,6 +751,7 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             ctx.simple("get_number", json!({ "target": target(&t)?, "decimal": decimal, "detail": detail }))
         }
         Cmd::Factors { target: t } => ctx.simple("get_factors", json!({ "target": target(&t)? })),
+        Cmd::FactorOf { target: t, limit } => ctx.simple("factor_of", json!({ "target": target(&t)?, "limit": limit })),
         Cmd::Primality { target: t } => ctx.simple("primality", json!({ "target": target(&t)? })),
         Cmd::Algebraic { target: t } => ctx.simple("algebraic_factors", json!({ "target": target(&t)? })),
         Cmd::Family { expr, start, limit } => ctx.simple("get_family", json!({ "expr": expr, "start": start, "limit": limit })),
@@ -1472,7 +1481,7 @@ fn print_seq_types() {
 
 /// Command groups in display order; every visible subcommand must appear here (checked in tests).
 const GROUPS: &[(&str, &[&str])] = &[
-    ("Numbers & factors", &["id", "number", "factors", "primality", "algebraic", "family", "report"]),
+    ("Numbers & factors", &["id", "number", "factors", "factor-of", "primality", "algebraic", "family", "report"]),
     ("Primality proofs", &["prove", "proof-progress", "proof-state", "proof-list"]),
     ("Probable-prime tests", &["prp-test", "prp-test-info"]),
     ("Certificates", &["cert"]),

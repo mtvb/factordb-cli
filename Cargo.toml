@@ -3,7 +3,7 @@ name = "fdb-cli"
 version = "0.1.0"
 edition = "2024"
 description = "Command-line client for the factordb JSON-RPC API"
-license = "GPL-2.0-only"
+license = "GPL-2.0-or-later"
 authors = ["Markus Tervooren"]
 
 [[bin]]
