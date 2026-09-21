@@ -46,7 +46,10 @@ pub fn parse_level(s: &str) -> std::result::Result<u8, String> {
 }
 
 pub struct Opts {
-    pub start: u64,
+    /// The RPC `start` Target (a WireTarget: `{"expr": ...}` or `{"id": N}`) - any size.
+    pub start: serde_json::Value,
+    /// Short label for the start, for progress/summary lines (the user's input).
+    pub start_label: String,
     pub kind: u8,
     pub kind_name: String,
     pub threads: usize,
@@ -130,13 +133,13 @@ pub fn run(ctx: &Ctx, o: &Opts) -> Result<()> {
 
     loop {
         // The view advances the frontier as far as the service can factor, then shows the last term.
-        let view = ctx.client.call_long("sequence_view", json!({ "start": o.start, "type": o.kind, "part": "last" }))?;
+        let view = ctx.client.call_long("sequence_view", json!({ "start": o.start.clone(), "type": o.kind, "part": "last" }))?;
         let status = &view["status"];
         length = status["length"].as_u64().unwrap_or(0);
         let end = &status["end"];
         if first_index.is_none() {
             start_length = length;
-            say(format!("sequence {} ({}): length {}, {}", o.start, o.kind_name, length, end_text(end)));
+            say(format!("sequence {} ({}): length {}, {}", o.start_label, o.kind_name, length, end_text(end)));
         }
         if end.get("kind").and_then(Value::as_str) != Some("open") {
             stop = format!("the sequence is no longer open: it {}", end_text(end));
@@ -166,7 +169,7 @@ pub fn run(ctx: &Ctx, o: &Opts) -> Result<()> {
         let leaves = composite_leaves(ctx, term["factors"].as_array().map(Vec::as_slice).unwrap_or(&[]), 0)?;
         let Some(leaf) = leaves.into_iter().max_by_key(|l| l.value.len()) else {
             // Fully factored yet still open: the service should be able to extend it.
-            let ext = ctx.client.call_long("extend_sequence", json!({ "start": o.start, "type": o.kind, "steps": 1000 }))?;
+            let ext = ctx.client.call_long("extend_sequence", json!({ "start": o.start.clone(), "type": o.kind, "steps": 1000 }))?;
             let new_len = ext["length"].as_u64().unwrap_or(0);
             if new_len > length {
                 stalled_extends = 0;
@@ -245,7 +248,7 @@ pub fn run(ctx: &Ctx, o: &Opts) -> Result<()> {
             })
             .collect();
         ctx.print_json(&json!({
-            "start": o.start, "type": o.kind, "length_before": start_length, "length_after": length,
+            "start": o.start.clone(), "type": o.kind, "length_before": start_length, "length_after": length,
             "terms_advanced": advanced, "factors": factors, "stopped": stop, "seconds": t_all.elapsed().as_secs_f64(),
         }));
     } else {

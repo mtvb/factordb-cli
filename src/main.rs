@@ -13,8 +13,6 @@ use serde_json::{Value, json};
 use client::{Call, Client, Error, Result, target};
 use config::Config;
 
-/// Ids at or below this are literal values, not stored rows (fdb_core::ids::STARTDB).
-const STARTDB: u64 = 1_000_000_000_000_000_000;
 
 const TARGET_HELP: &str = "A number: an expression (2^127-1, 150!+1, 10^80+7, 12345) or a stored id written id:N";
 const TYPE_HELP: &str = "Which sequence family: a name or code aliquot (1), hp10 = home prime base 10, ihp3 = inverse home \
@@ -98,6 +96,16 @@ enum Cmd {
     },
     /// The known factorization of a number [get_factors]
     Factors {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+    },
+    /// The next prime above a number (view-only, not stored; max 3000 digits) [nearest_prime]
+    Nextprime {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+    },
+    /// The previous prime below a number (max 3000 digits) [nearest_prime]
+    Prevprime {
         #[arg(help = TARGET_HELP)]
         target: String,
     },
@@ -449,11 +457,14 @@ enum SeqCmd {
         #[arg(long, value_parser = ["open", "merge", "cycle", "terminus", "all"], value_name = "KIND")]
         end: Option<String>,
         /// Sort column
-        #[arg(long, value_parser = ["length", "start"])]
+        #[arg(long, value_parser = ["length", "start", "driver"])]
         sort: Option<String>,
         /// Sort direction
         #[arg(long, value_parser = ["asc", "desc"])]
         dir: Option<String>,
+        /// Only sequences on this aliquot driver (0 none, 1 downdriver, 2-5 named, 6 perfect)
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=6), value_name = "CODE")]
+        driver: Option<u8>,
     },
     /// Which sequences a number is a term of [sequence_of]
     Of {
@@ -751,6 +762,8 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             ctx.simple("get_number", json!({ "target": target(&t)?, "decimal": decimal, "detail": detail }))
         }
         Cmd::Factors { target: t } => ctx.simple("get_factors", json!({ "target": target(&t)? })),
+        Cmd::Nextprime { target: t } => ctx.simple("nearest_prime", json!({ "target": target(&t)? })),
+        Cmd::Prevprime { target: t } => ctx.simple("nearest_prime", json!({ "target": target(&t)?, "below": true })),
         Cmd::FactorOf { target: t, limit } => ctx.simple("factor_of", json!({ "target": target(&t)?, "limit": limit })),
         Cmd::Primality { target: t } => ctx.simple("primality", json!({ "target": target(&t)? })),
         Cmd::Algebraic { target: t } => ctx.simple("algebraic_factors", json!({ "target": target(&t)? })),
@@ -1152,7 +1165,7 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             let start = resolve_start(ctx, &start)?;
             ctx.simple_long("extend_sequence", json!({ "start": start, "steps": steps, "type": kind }))
         }
-        SeqCmd::List { limit, offset, kind, category, end, sort, dir } => {
+        SeqCmd::List { limit, offset, kind, category, end, sort, dir, driver } => {
             let mut p = json!({ "limit": limit, "offset": offset, "type": kind, "category": category });
             if let Some(e) = end.filter(|e| e != "all") {
                 p["end_kind"] = Value::String(e);
@@ -1163,10 +1176,14 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             if let Some(d) = dir {
                 p["dir"] = Value::String(d);
             }
+            if let Some(dr) = driver {
+                p["driver"] = json!(dr);
+            }
             ctx.simple("list_sequences", p)
         }
         SeqCmd::Of { target: t } => ctx.simple("sequence_of", json!({ "target": target(&t)? })),
         SeqCmd::Advance { start, kind, threads, from, to, terms, max_digits, ecm, heartbeat, no_submit } => {
+            let start_label = start.clone();
             let start = resolve_start(ctx, &start)?;
             let threads = threads
                 .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
@@ -1176,6 +1193,7 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
                 ctx,
                 &advance::Opts {
                     start,
+                    start_label,
                     kind,
                     kind_name,
                     threads,
@@ -1302,32 +1320,22 @@ fn finish_session(ctx: &mut Ctx, method: &str, v: &Value, no_save: bool, rotate:
     ctx.keep_token(&token, no_save, rotate)
 }
 
-/// A sequence start: a value up to 10^18 (integer or expression), or a stored id given as `id:N`.
-/// On the wire a start above 10^18 is a stored id, so a plain value that large is refused.
-fn resolve_start(ctx: &Ctx, s: &str) -> Result<u64> {
+/// A sequence start as the RPC `start` Target (a WireTarget JSON value): an expression or decimal of
+/// ANY size (`{"expr": ...}`), or an explicit stored id given as `id:N` / `fid:N` (`{"id": N}`). No
+/// size cap here - the RPC evaluates and (for a new value) mints it, enforcing the 10^7-digit eval
+/// limit; a start given as a stored id is used directly (e.g. a large Mersenne already in the DB).
+fn resolve_start(_ctx: &Ctx, s: &str) -> Result<serde_json::Value> {
     let t = s.trim();
     for prefix in ["id:", "fid:"] {
         if let Some(rest) = t.strip_prefix(prefix) {
-            return rest.trim().parse::<u64>().map_err(|_| Error::Usage(format!("'{s}': an id must be an integer after '{prefix}'")));
+            let n: u64 = rest.trim().parse().map_err(|_| Error::Usage(format!("'{s}': an id must be an integer after '{prefix}'")))?;
+            return Ok(json!({ "id": n }));
         }
     }
-    let n = match t.parse::<u64>() {
-        Ok(n) => n,
-        Err(_) => {
-            let v = ctx.client.call("get_number", json!({ "target": { "expr": t }, "decimal": true, "detail": 0 }))?;
-            let dec = v.get("decimal").and_then(Value::as_str).unwrap_or("");
-            dec.parse::<u64>().map_err(|_| Error::Usage(format!("'{s}' does not evaluate to a whole number up to 10^18")))?
-        }
-    };
-    if n > STARTDB {
-        return Err(Error::Usage(format!(
-            "start {n} is above 10^18: sequence starts are values up to 10^18 (a stored number can be given as id:N)"
-        )));
+    if t.is_empty() {
+        return Err(Error::Usage("the start must not be empty".into()));
     }
-    if n < 2 {
-        return Err(Error::Usage("the start must be an integer of at least 2".into()));
-    }
-    Ok(n)
+    Ok(json!({ "expr": t }))
 }
 
 fn table_name(given: &str, allowed: &[&str]) -> Result<String> {
@@ -1440,6 +1448,11 @@ fn seq_type_catalog() -> Vec<(u8, String, String)> {
         (25, "lpf2-2", "largest prime factor ^2 - 2"),
         (26, "lpf3+1", "largest prime factor ^3 + 1"),
         (27, "lpf3-1", "largest prime factor ^3 - 1"),
+        (54, "augmented", "Augmented aliquot: sigma(n) - n + 1"),
+        (55, "quasi", "Quasi-aliquot: sigma(n) - n - 1"),
+        (56, "unitary", "Unitary aliquot: sigma*(n) - n"),
+        (58, "coreful", "Coreful aliquot: coreful divisor sum - n"),
+        (59, "biunitary", "Bi-unitary aliquot: sigma**(n) - n"),
     ] {
         rows.push((code, name.into(), label.into()));
     }
@@ -1481,7 +1494,7 @@ fn print_seq_types() {
 
 /// Command groups in display order; every visible subcommand must appear here (checked in tests).
 const GROUPS: &[(&str, &[&str])] = &[
-    ("Numbers & factors", &["id", "number", "factors", "factor-of", "primality", "algebraic", "family", "report"]),
+    ("Numbers & factors", &["id", "number", "factors", "factor-of", "nextprime", "prevprime", "primality", "algebraic", "family", "report"]),
     ("Primality proofs", &["prove", "proof-progress", "proof-state", "proof-list"]),
     ("Probable-prime tests", &["prp-test", "prp-test-info"]),
     ("Certificates", &["cert"]),

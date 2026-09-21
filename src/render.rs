@@ -13,6 +13,7 @@ pub fn render(method: &str, v: &Value) -> String {
     match method {
         "get_id" => r_get_id(&mut o, v),
         "get_number" => r_number(&mut o, v),
+        "nearest_prime" => r_nearest_prime(&mut o, v),
         "get_factors" => r_factors(&mut o, v),
         "factor_of" => r_factor_of(&mut o, v),
         "primality" => primality_kv(v).write(&mut o, 0),
@@ -289,15 +290,31 @@ pub fn perm_desc(perm: u64) -> String {
     if bits.is_empty() { format!("{perm} (none)") } else { format!("{perm} ({})", bits.join(", ")) }
 }
 
-/// A number's display: the term if stored as one, else the decimal preview (with an ellipsis when
-/// the preview is a prefix of a longer value).
+/// A number's display for a list cell: the stored formula term if any, else the decimal rendered
+/// compactly as "head .. tail<digits>" from the leading (`preview`) and trailing (`tail`) chunks the
+/// server sends for a long number (the previews are up to 100 digits each, so slice them short here),
+/// else the full value when it is small enough to fit `preview`.
 fn number_text(v: &Value) -> String {
+    const HEAD: usize = 16;
+    const TAIL: usize = 6;
     let term = s(v, "term");
     if !term.is_empty() {
         return term.to_string();
     }
     let p = s(v, "preview");
-    if u(v, "digits") > p.chars().count() as u64 { format!("{p} ") } else { p.to_string() }
+    let digits = u(v, "digits");
+    let tail = s(v, "tail");
+    if !tail.is_empty() {
+        let head: String = p.chars().take(HEAD).collect();
+        let tc: Vec<char> = tail.chars().collect();
+        let t: String = tc[tc.len().saturating_sub(TAIL)..].iter().collect();
+        return format!("{head}…{t}<{digits}>");
+    }
+    if digits > p.chars().count() as u64 {
+        format!("{}…<{digits}>", p.chars().take(HEAD).collect::<String>())
+    } else {
+        p.to_string()
+    }
 }
 
 fn truncate(t: &str, max: usize) -> String {
@@ -388,9 +405,22 @@ pub fn table(o: &mut String, headers: &[&str], rows: &[Vec<String>], indent: usi
 
 // ---- factors -----------------------------------------------------------------------------------
 
+/// A factor's base for display. A small factor arrives whole; a large one (>1000 digits) arrives as
+/// a leading preview (`base`) plus trailing digits (`tail`) and its true `digits` count, so render it
+/// as "head…tail<digits>" rather than showing only the truncated leading chunk.
+fn factor_base(f: &Value) -> String {
+    let base = s(f, "base");
+    let tail = s(f, "tail");
+    if !tail.is_empty() {
+        format!("{base}…{tail}<{}>", u(f, "digits"))
+    } else {
+        base.to_string()
+    }
+}
+
 /// One factor as base^exp[status] - the status tag is shown for anything but a proven prime.
 fn factor_str(f: &Value) -> String {
-    let mut t = s(f, "base").to_string();
+    let mut t = factor_base(f);
     let e = u(f, "exponent");
     if e > 1 {
         let _ = write!(t, "^{e}");
@@ -412,7 +442,7 @@ fn factor_lines(o: &mut String, f: &Value, indent: usize) {
         return;
     }
     for x in list {
-        let mut line = format!("{pad}{}", s(x, "base"));
+        let mut line = format!("{pad}{}", factor_base(x));
         let e = u(x, "exponent");
         if e > 1 {
             let _ = write!(line, "^{e}");
@@ -649,12 +679,12 @@ fn r_proof_state(o: &mut String, v: &Value) {
 fn r_proof_list(o: &mut String, v: &Value) {
     let rows: Vec<Vec<String>> = arr(v, "proofs")
         .iter()
-        .map(|p| vec![fid_label(p, "fid"), commas(u(p, "digits")), proof_type_name(i(p, "type")).into(), n(p, "base"), s(p, "term").to_string()])
+        .map(|p| vec![fid_label(p, "fid"), commas(u(p, "digits")), proof_type_name(i(p, "type")).into(), n(p, "base"), number_text(p)])
         .collect();
     if rows.is_empty() {
         o.push_str("(no proofs)\n");
     } else {
-        table(o, &["id", "digits", "method", "witness", "term"], &rows, 0);
+        table(o, &["id", "digits", "method", "witness", "number"], &rows, 0);
     }
 }
 
@@ -740,14 +770,14 @@ fn r_cert_list(o: &mut String, v: &Value) {
                 n(c, "tests"),
                 prog,
                 user,
-                truncate(s(c, "term"), 40),
+                number_text(c),
             ]
         })
         .collect();
     if rows.is_empty() {
         o.push_str("(no certificates)\n");
     } else {
-        table(o, &["id", "digits", "bytes", "state", "tests", "program", "user", "term"], &rows, 0);
+        table(o, &["id", "digits", "bytes", "state", "tests", "program", "user", "number"], &rows, 0);
     }
 }
 
@@ -820,6 +850,35 @@ fn r_seq_sizes(o: &mut String, v: &Value) {
     kv.add("length", commas(u(v, "length")));
     kv.add("end", end_str(v.get("end").unwrap_or(&Value::Null)));
     kv.write(o, 0);
+    // Aliquot driver track (parallel to sizes): collapse consecutive equal drivers into index runs -
+    // the text analogue of the coloured graph. Shown only when a real driver occurs (aliquot only).
+    let drivers: Vec<u64> = arr(v, "drivers").iter().map(|x| x.as_u64().unwrap_or(0)).collect();
+    if drivers.iter().any(|&d| d >= 1) {
+        o.push_str("drivers by index:\n");
+        let mut line = String::new();
+        let mut i0 = 0usize;
+        for k in 1..=drivers.len() {
+            if k == drivers.len() || drivers[k] != drivers[i0] {
+                let cell = if i0 == k - 1 {
+                    format!("{i0}:{}", driver_word(drivers[i0]))
+                } else {
+                    format!("{i0}-{}:{}", k - 1, driver_word(drivers[i0]))
+                };
+                if !line.is_empty() && line.chars().count() + cell.chars().count() + 1 > 100 {
+                    let _ = writeln!(o, "  {line}");
+                    line.clear();
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(&cell);
+                i0 = k;
+            }
+        }
+        if !line.is_empty() {
+            let _ = writeln!(o, "  {line}");
+        }
+    }
     let sizes: Vec<String> = arr(v, "sizes").iter().map(|x| x.as_u64().unwrap_or(0).to_string()).collect();
     if !sizes.is_empty() {
         let max = arr(v, "sizes").iter().filter_map(Value::as_u64).max().unwrap_or(0);
@@ -900,6 +959,44 @@ fn r_seq_extend(o: &mut String, v: &Value) {
     kv.write(o, 0);
 }
 
+/// `nearest_prime` result: the neighbour prime's record (same shape as get_number), or a note when
+/// there is no previous prime (N ≤ 2).
+fn r_nearest_prime(o: &mut String, v: &Value) {
+    if !b(v, "found") {
+        o.push_str("(no prime below this number)\n");
+        return;
+    }
+    match v.get("number") {
+        Some(num) => r_number(o, num),
+        None => o.push_str("(no result)\n"),
+    }
+}
+
+/// Short word for an aliquot driver code (see the core's seq_guide DRIVER_*): the descending
+/// downdriver, the growing named drivers, the (very sticky) even-perfect drivers, else a plain guide.
+fn driver_word(code: u64) -> &'static str {
+    match code {
+        1 => "downdriver",
+        2..=5 => "driver",
+        6 => "perfect",
+        _ => "plain",
+    }
+}
+
+/// The "driver" cell for a sequence overview row: the frontier term's aliquot guide, its kind, and
+/// its class (lower = stickier). Empty guide (non-aliquot, or unknown) renders as "-".
+fn seq_driver_cell(q: &Value) -> String {
+    let guide = s(q, "guide");
+    if guide.is_empty() {
+        return "-".into();
+    }
+    let class = i(q, "class");
+    match u(q, "driver") {
+        0 => format!("{guide} c{class}"), // plain guide, no driver
+        code => format!("{} {guide} c{class}", driver_word(code)),
+    }
+}
+
 fn r_seq_list(o: &mut String, v: &Value) {
     let rows: Vec<Vec<String>> = arr(v, "sequences")
         .iter()
@@ -912,13 +1009,13 @@ fn r_seq_list(o: &mut String, v: &Value) {
                 end_str(&end)
             };
             let comp = if has(q, "composite") { format!("{} ({}d)", truncate(s(q, "composite"), 24), u(q, "composite_digits")) } else { "-".into() };
-            vec![start, commas(u(q, "digits")), commas(u(q, "length")), end_txt, comp]
+            vec![start, commas(u(q, "digits")), commas(u(q, "length")), end_txt, comp, seq_driver_cell(q)]
         })
         .collect();
     if rows.is_empty() {
         o.push_str("(no sequences)\n");
     } else {
-        table(o, &["start", "digits", "length", "end", "last composite"], &rows, 0);
+        table(o, &["start", "digits", "length", "end", "last composite", "driver"], &rows, 0);
     }
 }
 
@@ -959,9 +1056,7 @@ fn r_smallest(o: &mut String, v: &Value, indent: usize) {
     for (key, label) in [("prp", "smallest PRP"), ("c", "smallest C"), ("u", "smallest U")] {
         match v.get(key) {
             Some(x) if !x.is_null() => {
-                let p = s(x, "preview");
-                let preview = if u(x, "digits") > p.chars().count() as u64 { format!("{p} ") } else { p.to_string() };
-                kv.add(label, format!("{} digits  #{}  {preview}", commas(u(x, "digits")), u(x, "fid")));
+                kv.add(label, format!("{} digits  #{}  {}", commas(u(x, "digits")), u(x, "fid"), number_text(x)));
             }
             _ => {
                 kv.add(label, "-");
@@ -1123,14 +1218,14 @@ fn r_ecm_list(o: &mut String, v: &Value) {
                 n(f, "sigma"),
                 date_utc(i(f, "ts")),
                 who,
-                truncate(s(f, "term"), 40),
+                number_text(f),
             ]
         })
         .collect();
     if rows.is_empty() {
         o.push_str("(no factors)\n");
     } else {
-        table(o, &["id", "digits", "method", "B1", "B2", "sigma", "found", "by", "term"], &rows, 0);
+        table(o, &["id", "digits", "method", "B1", "B2", "sigma", "found", "by", "number"], &rows, 0);
     }
 }
 
