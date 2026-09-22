@@ -1441,6 +1441,10 @@ fn seq_type_catalog() -> Vec<(u8, String, String)> {
     for b in 2..=11u8 {
         rows.push((10 + b, format!("ihp{b}"), format!("Inverse home prime, base {b}")));
     }
+    // Inverse home prime bases 12..=36 use codes 62..=86 (code = base + 50).
+    for b in 12..=36u8 {
+        rows.push((b + 50, format!("ihp{b}"), format!("Inverse home prime, base {b}")));
+    }
     for (code, name, label) in [
         (22, "lpf2+1", "largest prime factor ^2 + 1"),
         (23, "lpf2+2", "largest prime factor ^2 + 2"),
@@ -1453,6 +1457,8 @@ fn seq_type_catalog() -> Vec<(u8, String, String)> {
         (56, "unitary", "Unitary aliquot: sigma*(n) - n"),
         (58, "coreful", "Coreful aliquot: coreful divisor sum - n"),
         (59, "biunitary", "Bi-unitary aliquot: sigma**(n) - n"),
+        (60, "exponential", "Exponential aliquot: sigma^(e)(n) - n"),
+        (61, "infinitary", "Infinitary aliquot: sigma_inf(n) - n"),
     ] {
         rows.push((code, name.into(), label.into()));
     }
