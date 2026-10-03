@@ -20,6 +20,8 @@ pub fn render(method: &str, v: &Value) -> String {
         "algebraic_factors" => r_algebraic(&mut o, v, 0),
         "get_family" => r_family(&mut o, v),
         "report_factors" => r_report(&mut o, v),
+        "check_factors" => r_check_factors(&mut o, v),
+        "snfs_poly" => crate::snfs::list(&mut o, v),
         "prove" => r_prove(&mut o, v),
         "proof_progress" => r_proof_progress(&mut o, v),
         "proof_state" => r_proof_state(&mut o, v),
@@ -31,6 +33,8 @@ pub fn render(method: &str, v: &Value) -> String {
         "cert_list" => r_cert_list(&mut o, v),
         "cert_chain" => r_cert_chain(&mut o, v),
         "cert_stats" => cert_stats_kv(v).write(&mut o, 0),
+        "cert_top" => r_cert_top(&mut o, v),
+        "cert_software_top" => r_cert_software_top(&mut o, v),
         "get_sequence" => r_seq_get(&mut o, v),
         "sequence_sizes" => r_seq_sizes(&mut o, v),
         "sequence_status" => r_seq_status(&mut o, v, 0),
@@ -52,6 +56,7 @@ pub fn render(method: &str, v: &Value) -> String {
         "whoami" => r_whoami(&mut o, v),
         "logout" => o.push_str("logged out\n"),
         "quota_status" => r_quota(&mut o, v),
+        "contributions" => r_contributions(&mut o, v),
         "health" => writeln!(o, "{}", if s(v, "status") == "ok" { "ok" } else { "unhealthy" }).unwrap(),
         _ => {
             o.push_str(&pretty(v));
@@ -485,6 +490,12 @@ fn r_number(o: &mut String, v: &Value) {
     }
     kv.add_if(has(v, "info"), "info", s(v, "info"));
     kv.write(o, 0);
+    // Scanner effort: the core sends ONE integer (the Upile queue level, C/U only, detail>=2); the
+    // trial-division bound and gmp-ecm stages are derived here, exactly as the website does.
+    if let Some(level) = v.get("effort").and_then(Value::as_u64) {
+        o.push_str("\nscanner effort\n");
+        effort_kv(level).write(o, 2);
+    }
     if let Some(f) = v.get("factors") {
         let _ = writeln!(o, "\nfactors  [{}]", status_text(s(f, "status"), Some(b(f, "fully_factored"))));
         factor_lines(o, f, 2);
@@ -507,6 +518,43 @@ fn r_factors(o: &mut String, v: &Value) {
     let id = v.get("id").cloned().unwrap_or(Value::Null);
     let _ = writeln!(o, "{}  {}", id_label(&id), status_text(s(v, "status"), Some(b(v, "fully_factored"))));
     factor_lines(o, v, 2);
+}
+
+/// Label of scanner stage `level`: 0..=8 are the trial-division bases, 9+ the gmp-ecm stages. Mirrors
+/// the core's comb::base_filename / comb::ecm_stage (and the website's effort_stage_label) exactly.
+fn effort_stage_label(level: u64) -> String {
+    const BASES: [&str; 9] = ["1M", "10M", "100M", "1G", "10G", "10-20G", "20-30G", "30-40G", "40-100G"];
+    match level {
+        0..=8 => BASES[level as usize].to_string(),
+        9 => "P-1 B1=500000".to_string(),
+        10 => "P+1 c=3 B1=50000".to_string(),
+        11 => "ECM c=15 B1=150000".to_string(),
+        12 => "ECM c=25 B1=250000".to_string(),
+        n => {
+            // Beyond the old system: B1 doubles per level (capped like the core), curves grow by 20.
+            let steps = n - 12;
+            let b1: u64 = 250_000u64 << steps.min(20);
+            format!("ECM c={} B1={}", 25 + 20 * steps, b1)
+        }
+    }
+}
+
+/// What a scanner-effort level means, derived client-side from the single integer the RPC sends: a
+/// number at level L has survived trial division over bases 0..L-1 (shown as the bound reached) and,
+/// once L >= 9, the gmp-ecm stages 9..L-1, and is queued for stage L next.
+fn effort_kv(level: u64) -> Kv {
+    const BOUNDS: [&str; 9] = ["1M", "10M", "100M", "1G", "10G", "20G", "30G", "40G", "100G"];
+    let mut kv = Kv::new();
+    kv.add("level", level.to_string());
+    let tf = if level == 0 { "none yet".to_string() } else { format!("up to {}", BOUNDS[(level.min(9) - 1) as usize]) };
+    kv.add("trial division", tf);
+    let ecm_done: Vec<String> = (9..level).map(effort_stage_label).collect();
+    kv.add("ecm done", if ecm_done.is_empty() { "none yet".to_string() } else { ecm_done.join(" · ") });
+    kv.add(
+        "next",
+        if level >= 9 { effort_stage_label(level) } else { format!("trial division {}", effort_stage_label(level)) },
+    );
+    kv
 }
 
 fn primality_kv(v: &Value) -> Kv {
@@ -532,6 +580,22 @@ fn primality_kv(v: &Value) -> Kv {
     kv.add_if(has(v, "cert_digits"), "cert digits", commas(u(v, "cert_digits")));
     kv.add_if(has(v, "cert_type"), "cert type", n(v, "cert_type"));
     kv.add_if(has(v, "cert_processing"), "cert state", if b(v, "cert_processing") { "being verified" } else { "queued" });
+    // A second recorded proof next to a certificate (N-1 / N+1 / combined), with its witness base.
+    if let Some(a) = v.get("also_proof") {
+        let ak = s(a, "kind");
+        let adesc = match ak {
+            "n-1" => "Pocklington N-1 proof",
+            "n+1" => "Morrison N+1 proof",
+            "combined" => "combined N-1 / N+1 (BLS75) proof",
+            _ => "",
+        };
+        let base = if has(a, "base") { format!(", witness base {}", n(a, "base")) } else { String::new() };
+        kv.add("also proven by", format!("{ak} {adesc}{base}"));
+    }
+    // Verification in flight: the RPC's four ints, rendered like the website's progress line.
+    if let Some(p) = v.get("cert_progress") {
+        kv.add("cert progress", cert_progress_text(p, u(v, "digits")));
+    }
     if has(v, "cert_uploader") {
         let name = s(v, "cert_uploader");
         kv.add("cert uploader", if name.is_empty() { "anonymous".to_string() } else { format!("{name} (uid {})", u(v, "cert_user")) });
@@ -578,6 +642,38 @@ fn r_family(o: &mut String, v: &Value) {
     }
 }
 
+/// A report_factors result on one line, for the bulk `report-file` output: the number's id, its
+/// status code, how many ids the report created and (with --credit) how many factors were credited.
+pub fn report_line(v: &Value) -> String {
+    let id = v.get("id").cloned().unwrap_or(Value::Null);
+    let created = arr(v, "created_ids").len();
+    let mut out = format!("{}  {}  {} new id{}", id_label(&id), s(v, "status"), created, if created == 1 { "" } else { "s" });
+    if has(v, "credited") {
+        let _ = write!(out, ", {} credited", n(v, "credited"));
+    }
+    out
+}
+
+/// A check_factors result: what step ran (or would run), the factors found, the level afterwards.
+fn r_check_factors(o: &mut String, v: &Value) {
+    let mut kv = Kv::new();
+    kv.add("number", format!("#{}", s(v, "fid")));
+    kv.add("digits", commas(u(v, "digits")));
+    kv.add("status", status_text(s(v, "status"), None));
+    let ran = b(v, "ran");
+    match (has(v, "step"), ran) {
+        (true, true) => { kv.add("ran", s(v, "step").to_string()); }
+        (true, false) => { kv.add("next step", s(v, "step").to_string()); }
+        (false, _) => { kv.add("next step", format!("none - already checked (up to {} digits)", commas(u(v, "max_digits")))); }
+    }
+    if ran {
+        let fs: Vec<String> = arr(v, "factors").iter().filter_map(|f| f.as_str().map(str::to_string)).collect();
+        kv.add("factors found", if fs.is_empty() { "none".to_string() } else { fs.join(", ") });
+    }
+    kv.add("level", n(v, "level"));
+    kv.write(o, 0);
+}
+
 fn r_report(o: &mut String, v: &Value) {
     let id = v.get("id").cloned().unwrap_or(Value::Null);
     let mut kv = Kv::new();
@@ -592,7 +688,35 @@ fn r_report(o: &mut String, v: &Value) {
         })
         .collect();
     kv.add("created ids", if ids.is_empty() { "none".to_string() } else { ids.join(", ") });
+    // Present only when the report asked for credit (--credit): how many factors were credited.
+    kv.add_if(has(v, "credited"), "credited", n(v, "credited"));
     kv.write(o, 0);
+}
+
+fn r_contributions(o: &mut String, v: &Value) {
+    let _ = writeln!(o, "credited factors  {}", commas(u(v, "total")));
+    let _ = writeln!(o, "largest           {} digits", commas(u(v, "largest_digits")));
+    let rows: Vec<Vec<String>> = arr(v, "rows")
+        .iter()
+        .map(|r| {
+            // The number the factor was reported against, reshaped so number_text can render it.
+            let parent = serde_json::json!({
+                "fid": r["parent"].clone(), "digits": r["parent_digits"].clone(), "term": r["parent_term"].clone(),
+                "preview": r["parent_preview"].clone(), "tail": r["parent_tail"].clone(),
+            });
+            vec![
+                fid_label(r, "fid"),
+                commas(u(r, "digits")),
+                date_utc(i(r, "ts")),
+                number_text(r),
+                format!("{} ({})", number_text(&parent), fid_label(&parent, "fid")),
+            ]
+        })
+        .collect();
+    if !rows.is_empty() {
+        o.push('\n');
+        table(o, &["id", "digits", "credited", "factor", "of"], &rows, 0);
+    }
 }
 
 // ---- proofs & PRP tests ------------------------------------------------------------------------
@@ -766,7 +890,10 @@ fn r_cert_list(o: &mut String, v: &Value) {
                 fid_label(c, "fid"),
                 commas(u(c, "digits")),
                 commas(u(c, "size")),
-                cert_state(i(c, "processed")).into(),
+                match c.get("progress") {
+                    Some(p) => format!("processing {}/{}", commas(u(p, "done")), commas(u(p, "total"))),
+                    None => cert_state(i(c, "processed")).into(),
+                },
                 n(c, "tests"),
                 prog,
                 user,
@@ -782,7 +909,16 @@ fn r_cert_list(o: &mut String, v: &Value) {
 }
 
 fn r_cert_chain(o: &mut String, v: &Value) {
-    let _ = writeln!(o, "certificate chain of #{}", u(v, "fid"));
+    let shown = arr(v, "chain").len() as u64;
+    let (total, skip) = (u(v, "total"), u(v, "skip"));
+    // A paged reply (the server sends the chain's total): say which window this is.
+    if total > 0 && shown == 0 {
+        let _ = writeln!(o, "certificate chain of #{}: nothing at offset {} ({} steps in total)", u(v, "fid"), skip, commas(total));
+    } else if total > 0 && (skip > 0 || shown < total) {
+        let _ = writeln!(o, "certificate chain of #{}: steps {}-{} of {}", u(v, "fid"), skip + 1, skip + shown, commas(total));
+    } else {
+        let _ = writeln!(o, "certificate chain of #{}", u(v, "fid"));
+    }
     let rows: Vec<Vec<String>> = arr(v, "chain")
         .iter()
         .map(|c| {
@@ -803,7 +939,100 @@ fn cert_stats_kv(v: &Value) -> Kv {
     kv.add("verified", commas(u(v, "verified")));
     kv.add("pending", commas(u(v, "pending")));
     kv.add("processing", commas(u(v, "processing")));
+    for p in arr(v, "running") {
+        kv.add(&format!("verifying #{}", s(p, "fid")), cert_progress_text(p, 0));
+    }
     kv
+}
+
+/// A leaderboard score (a float on the wire), rounded and grouped.
+fn score_text(v: &Value, k: &str) -> String {
+    commas(v.get(k).and_then(Value::as_f64).unwrap_or(0.0).round() as u64)
+}
+
+fn r_cert_top(o: &mut String, v: &Value) {
+    let rows: Vec<Vec<String>> = arr(v, "users")
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let name = if s(r, "fullname").is_empty() { "Anonymous".to_string() } else { s(r, "fullname").to_string() };
+            vec![(i + 1).to_string(), n(r, "uid"), name, commas(u(r, "certs")), bytes_h(u(r, "size")), score_text(r, "score")]
+        })
+        .collect();
+    if rows.is_empty() {
+        o.push_str("(no certificates)\n");
+    } else {
+        table(o, &["rank", "uid", "user", "certs", "size", "score"], &rows, 0);
+    }
+    if let Some(t) = v.get("totals") {
+        let _ = writeln!(o, "\ntotals  {} uploaders, {} certificates, {}, score {}", commas(u(t, "rows")), commas(u(t, "certs")), bytes_h(u(t, "size")), score_text(t, "score"));
+    }
+}
+
+fn r_cert_software_top(o: &mut String, v: &Value) {
+    let progs: Vec<Vec<String>> = arr(v, "programs")
+        .iter()
+        .enumerate()
+        .map(|(i, r)| vec![(i + 1).to_string(), s(r, "program").to_string(), commas(u(r, "versions")), commas(u(r, "certs")), bytes_h(u(r, "size")), score_text(r, "score")])
+        .collect();
+    if !progs.is_empty() {
+        o.push_str("by software\n");
+        table(o, &["rank", "software", "versions", "certs", "size", "score"], &progs, 2);
+        o.push('\n');
+    }
+    let vers: Vec<Vec<String>> = arr(v, "versions")
+        .iter()
+        .enumerate()
+        .map(|(i, r)| vec![(i + 1).to_string(), n(r, "type"), s(r, "program").to_string(), s(r, "version").to_string(), commas(u(r, "certs")), bytes_h(u(r, "size")), score_text(r, "score")])
+        .collect();
+    if vers.is_empty() {
+        o.push_str("(no software versions)\n");
+    } else {
+        o.push_str("by software version\n");
+        table(o, &["rank", "id", "software", "version", "certs", "size", "score"], &vers, 2);
+    }
+    if let Some(t) = v.get("totals") {
+        let _ = writeln!(o, "\ntotals  {} versions, {} certificates, {}, score {}", commas(u(t, "rows")), commas(u(t, "certs")), bytes_h(u(t, "size")), score_text(t, "score"));
+    }
+}
+
+fn cert_progress_text(p: &Value, start: u64) -> String {
+    let (done, total, cur, started) = (u(p, "done"), u(p, "total"), u(p, "digits"), u(p, "started"));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let elapsed = if started > 0 && now > started { now - started } else { 0 };
+    let mut out = format!("step {} of {}", commas(done), if total > 0 { commas(total) } else { "?".into() });
+    if total > 0 {
+        out.push_str(&format!(" ({:.1} %)", 100.0 * done as f64 / total as f64));
+    }
+    if cur > 0 {
+        out.push_str(&format!(" · frontier at {} digits", commas(cur)));
+    }
+    if elapsed > 0 {
+        out.push_str(&format!(" · running {}", elapsed_text(elapsed)));
+    }
+    if start > 0 && cur > 0 && cur <= start && done > 0 {
+        let work = 1.0 - (cur as f64 / start as f64).powi(4);
+        if work > 0.02 && work < 1.0 {
+            out.push_str(&format!(" · ~{:.0} % of the work done", 100.0 * work));
+            if elapsed > 60 {
+                out.push_str(&format!(", ETA ~{}", elapsed_text((elapsed as f64 * (1.0 - work) / work) as u64)));
+            }
+        }
+    }
+    out
+}
+
+/// "3 d 4 h" / "2 h 15 min" / "7 min" / "45 s".
+fn elapsed_text(s: u64) -> String {
+    if s >= 86400 {
+        format!("{} d {} h", s / 86400, (s % 86400) / 3600)
+    } else if s >= 3600 {
+        format!("{} h {} min", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s} s")
+    }
 }
 
 // ---- sequences ---------------------------------------------------------------------------------
@@ -959,8 +1188,6 @@ fn r_seq_extend(o: &mut String, v: &Value) {
     kv.write(o, 0);
 }
 
-/// `nearest_prime` result: the neighbour prime's record (same shape as get_number), or a note when
-/// there is no previous prime (N ≤ 2).
 fn r_nearest_prime(o: &mut String, v: &Value) {
     if !b(v, "found") {
         o.push_str("(no prime below this number)\n");
@@ -1020,17 +1247,20 @@ fn r_seq_list(o: &mut String, v: &Value) {
 }
 
 fn r_seq_of(o: &mut String, v: &Value, indent: usize) {
+    // The membership lookup covers every sequence type: each entry carries its `type` code (an
+    // older server sends none - those entries are aliquot). The type column shows the --type name.
     let rows: Vec<Vec<String>> = arr(v, "sequences")
         .iter()
         .map(|m| {
             let start = if has(m, "start") { s(m, "start").to_string() } else { format!("#{}", u(m, "start_id")) };
-            vec![start, n(m, "index"), commas(u(m, "length")), end_str(m.get("end").unwrap_or(&Value::Null))]
+            let kind = if has(m, "type") { crate::seq_type_label(u(m, "type")) } else { "aliquot".to_string() };
+            vec![kind, start, n(m, "index"), commas(u(m, "length")), end_str(m.get("end").unwrap_or(&Value::Null))]
         })
         .collect();
     if rows.is_empty() {
         let _ = writeln!(o, "{}(not a term of any known sequence)", " ".repeat(indent));
     } else {
-        table(o, &["sequence start", "index", "length", "end"], &rows, indent);
+        table(o, &["type", "sequence start", "index", "length", "end"], &rows, indent);
     }
 }
 

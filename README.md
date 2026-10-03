@@ -58,20 +58,26 @@ refused).
 
 **Which sequence family.** Every `seq` subcommand takes `--type` (alias `--sequence`), as a name or
 a code: `aliquot` (1, the default), `hp10` = home prime base 10 (also `home-prime-10`), `ihp3` =
-inverse home prime base 3, `lpf2+1`, `lpf3-1` = largest-prime-factor sequences. Names are
-case-insensitive; `fdb seq types` lists all codes and names.
+inverse home prime base 3, `lpf2+1`, `lpf3-1` = largest-prime-factor sequences, the aliquot
+variants `augmented`, `quasi`, `unitary`, `coreful`, `biunitary`, `exponential`, `infinitary`,
+Conway's climb to a prime `climb2` .. `climb36` (the factorization read literally, primes with
+their exponents), the prime-stopping maps `sigma-1`, `phi+1`, `cototient`, and the concatenation
+rules `dhp<b>` / `dihp<b>` (distinct primes, ascending / descending), `schp<b>` (second-class home
+prime, one copy of the least prime dropped) and `mdc<b>` (mid-divisor concatenation) for the bases
+`b` = 2, 3, 8, 10, 16. Names are case-insensitive; `fdb seq types` lists all codes and names.
 
 ## Commands
 
 | command | RPC method | notes |
 |---|---|---|
 | `id <EXPR> [--create]` | get_id | `--create` stores the number (write); values <= 10^18 are literals and never stored |
-| `number <TARGET> [--decimal] [--detail 0..2 \| --full]` | get_number | aliases `get`, `show`; default detail 1 (with factors) |
+| `number <TARGET> [--decimal] [--detail 0..2 \| --full]` | get_number | aliases `get`, `show`; default detail 1 (with factors); detail 2 adds primality, algebraic form and, for a composite in the scanner queue, its trial-division / ECM effort |
 | `factors <TARGET>` | get_factors | |
-| `primality <TARGET>` | primality | |
+| `primality <TARGET>` | primality | while a certificate is being verified, prints its progress (steps done, elapsed, a digit-weighted work estimate) |
 | `algebraic <TARGET>` | algebraic_factors | |
 | `family <EXPR> [--start N] [--limit N]` | get_family | `x` is the variable, e.g. `2^x-1` |
-| `report <TARGET> [FACTOR] [--file F]` | report_factors | write; `--file -` reads stdin |
+| `report <TARGET> [FACTOR] [--file F] [--credit]` | report_factors | write; `--file -` reads stdin; `--credit` records the factors as your contributions (token required; a factor counts when it is new for an existing number and both it and its cofactor have at least 30 digits) |
+| `report-file <FILE> [--batch N] [--from-line L] [--dry-run] [--credit]` | report_factors | write; bulk submit, one `NUMBER=FACTOR` per line (`NUMBER` an expression or an id written `#N`; `-` reads stdin); sent as JSON-RPC batches of `--batch` numbers per request (default 100); a `#` not followed by a digit starts a comment; malformed lines are skipped with a warning; `--from-line` resumes a stopped run |
 | `prove <TARGET>` | prove | write; large numbers queue |
 | `proof-progress <TARGET>` | proof_progress | write (may create the N±1 ids) |
 | `proof-state <TARGET> [--wait]` | proof_state | `--wait` polls until dequeued |
@@ -80,17 +86,19 @@ case-insensitive; `fdb seq types` lists all codes and names.
 | `prp-test-info <TARGET>` | prp_test_info | |
 | `cert get <TARGET> [-o FILE]` | get_certificate | the stored bytes, exactly, to stdout (metadata on stderr) or to FILE |
 | `cert upload <FILE>` | upload_certificate | write; `-` = stdin (once); see below |
-| `cert list [--min-digits] [--pending] [--descending] [--skip] [--limit]` | cert_list | smallest first; `--descending` for largest first |
-| `cert chain <TARGET>` | cert_chain | |
-| `cert stats` | cert_stats | |
+| `cert list [--min-digits] [--pending] [--descending] [--skip] [--limit] [--user UID] [--software ID]` | cert_list | smallest first; `--descending` for largest first; a certificate under verification shows `processing done/total`; `--user 0` = anonymous uploads |
+| `cert chain <TARGET> [--skip N] [--limit N]` | cert_chain | the whole chain by default; `--skip`/`--limit` page it (a paged reply says `steps a-b of total`) |
+| `cert stats` | cert_stats | totals, plus one `verifying #id` line per verification in flight |
+| `cert top [--by user\|software] [--sort score\|n\|size]` | cert_top / cert_software_top | the certificate leaderboards: top 100 uploaders, or the programs and their top 100 versions; score = sum of (digits/1000)^4 over verified certificates |
 | `seq get <START> [--from N] [--type T]` | get_sequence | elf-style `index . value = factors`; `--type` = family name or code |
 | `seq sizes <START> [--type T]` | sequence_sizes | |
 | `seq status <START> [--type T]` | sequence_status | |
 | `seq view <START> [--part all\|last\|last20\|range] [--fr N] [--type T]` | sequence_view | write (advances the frontier first) |
 | `seq extend <START> [--steps N] [--type T]` | extend_sequence | write |
-| `seq list [--limit] [--offset] [--type] [--category] [--end KIND] [--sort] [--dir]` | list_sequences | |
+| `seq advance <START> [--type T] [--threads N] [--from L] [--to L] [--terms N] [--max-digits D] [--ecm PATH] [--heartbeat S] [--no-submit] [--credit]` | sequence_view + report_factors | alias `work`; factors the open frontier locally with gmp-ecm over the t20..t65 ladder and reports each factor (write); `--credit` as in `report` |
+| `seq list [--limit] [--offset] [--type] [--category] [--end KIND] [--sort] [--dir] [--driver CODE] [--guide V]` | list_sequences | `--guide` filters on the frontier's exact guide value (finer than `--driver`) |
 | `seq of <TARGET>` | sequence_of | |
-| `seq types` | the `--type` codes and names (aliquot, hp2, hp36, ihp2, ihp11, lpf) |
+| `seq types` | the `--type` codes and names (aliquot and its variants, hp2..hp36, ihp2..ihp36, lpf, climb2..climb36, sigma-1, phi+1, cototient, dhp/dihp/schp/mdc on bases 2, 3, 8, 10, 16) |
 | `status` | status | the whole status page |
 | `stats` | stats | |
 | `smallest` | smallest | |
@@ -107,6 +115,7 @@ case-insensitive; `fdb seq types` lists all codes and names.
 | `regenerate-token [--no-save]` | regenerate_token | see token rules |
 | `logout` | logout | also forgets the saved token |
 | `quota` | quota_status | alias `quota-status` |
+| `contributions [--skip] [--limit]` | contributions | your credited factors, newest first (token required); earned with `report --credit` / `seq advance --credit` or the website's "Credit my factors" setting |
 | `health` | health | |
 | `call <METHOD> [PARAMS-JSON]` | any public method | escape hatch for new methods; `-` = stdin |
 | `batch [FILE]` | (batch request) | JSON array of `{method, params}` or one object per line |
@@ -140,8 +149,13 @@ commands print objects.
     fdb number 2^127-1 --full
     fdb factors id:1100000000024482356
     fdb report 1427247692705959880439315947500961989719490561 2^61-1
+    fdb report id:1100000000024531041 2^607-1 --credit   # credited to your account
+    fdb contributions
     fdb download C 60 --count 100 --random > work.txt
     fdb seq get 276 --from 1900
+    fdb seq get 20 --type climb10                       # Conway's climb to a prime
+    fdb seq list --type dihp10 --end cycle              # the 713 -> 3123 -> 3473 -> 15123 cycle
+    fdb seq advance 276 --threads 16 --to 45 --credit
     fdb cert get id:1100000000024481681 -o m1000.cert
     fdb cert upload *.out
     fdb ecm-group-order 1000003 --sigma 7 --param 0

@@ -2,6 +2,7 @@ mod advance;
 mod client;
 mod config;
 mod render;
+mod snfs;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -147,6 +148,28 @@ enum Cmd {
         /// Also read factors from FILE, one per line ('-' = stdin)
         #[arg(short, long, value_name = "FILE")]
         file: Option<PathBuf>,
+        /// Credit the factors to your account (new for an existing number; factor and cofactor both at least 30 digits)
+        #[arg(long)]
+        credit: bool,
+    },
+    /// Submit factors for many numbers from a file, one NUMBER=FACTOR per line [report_factors]
+    ReportFile {
+        /// File with one NUMBER=FACTOR per line ('-' = stdin). NUMBER is an expression or a stored id written
+        /// #N (or id:N); FACTOR is a decimal or an expression. Blank lines are skipped, and so are comment
+        /// lines: a '#' that is not followed by a digit. A malformed line is skipped with a warning
+        file: PathBuf,
+        /// Credit the factors to your account (see report --credit)
+        #[arg(long)]
+        credit: bool,
+        /// Numbers reported per request: the reports go out as JSON-RPC batches, N in one round-trip
+        #[arg(long, default_value_t = 100, value_name = "N")]
+        batch: usize,
+        /// Start at this line of the file (1 = the first), to resume a stopped run
+        #[arg(long, default_value_t = 1, value_name = "LINE")]
+        from_line: usize,
+        /// Check the file and show what would be sent, without submitting anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     // ---- Primality proofs ----
@@ -154,6 +177,31 @@ enum Cmd {
     Prove {
         #[arg(help = TARGET_HELP)]
         target: String,
+    },
+    /// Run the next bounded P-1 / P+1 / ECM step on a stored composite of at most 300 digits (the sequence page's
+    /// "Check for factors"); a factor found is reported like `report` [check_factors]
+    CheckFactors {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Only show the current level and the next step, run nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// SNFS polynomials for a composite of special form (sums of powers, cyclotomic and Aurifeuillian parts),
+    /// as a list or as the input file of GGNFS / yafu, msieve or CADO-NFS [snfs_poly]
+    Snfs {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// list = every polynomial found, best first; ggnfs (a GGNFS / yafu job file), msieve (.fb) or cado (.poly)
+        /// = one polynomial as that tool's input file, with sieving parameters for its difficulty
+        #[arg(long, value_enum, default_value_t = SnfsFormat::List)]
+        format: SnfsFormat,
+        /// Which polynomial of the list to print as a file (0 = the best)
+        #[arg(long, default_value_t = 0, value_name = "I")]
+        poly: usize,
+        /// Write to FILE instead of stdout
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
     /// Per-method completeness and the cost of proving a number [proof_progress]
     ProofProgress {
@@ -284,6 +332,9 @@ enum Cmd {
         /// Start at a random position within that size instead of the smallest
         #[arg(long)]
         random: bool,
+        /// Each number as its full stored term (a cofactor as (parent)/known factors) instead of the export format
+        #[arg(long)]
+        terms: bool,
         /// Write the numbers to FILE instead of stdout
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
@@ -329,6 +380,13 @@ enum Cmd {
     /// Your resource usage against the per-client limits [quota_status]
     #[command(visible_alias = "quota-status")]
     Quota,
+    /// Your credited factor contributions, newest first (see report --credit) [contributions]
+    Contributions {
+        #[arg(long, default_value_t = 0)]
+        skip: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+    },
 
     // ---- Utility ----
     /// Liveness check [health]
@@ -383,11 +441,31 @@ enum CertCmd {
         skip: u64,
         #[arg(long, default_value_t = 100)]
         limit: u64,
+        /// Only certificates uploaded by this account (uid; 0 = anonymous)
+        #[arg(long)]
+        user: Option<u64>,
+        /// Only certificates by this software version (its id, from `cert top --by software`)
+        #[arg(long)]
+        software: Option<u64>,
     },
     /// The chain of certificates a number's certificate depends on [cert_chain]
     Chain {
         #[arg(help = TARGET_HELP)]
         target: String,
+        #[arg(long, default_value_t = 0)]
+        skip: u64,
+        /// 0 = the whole chain
+        #[arg(long, default_value_t = 0)]
+        limit: u64,
+    },
+    /// Certificate leaderboards: by uploader, or by software and version [cert_top / cert_software_top]
+    Top {
+        /// user (default) or software
+        #[arg(long, default_value = "user", value_parser = ["user", "software"])]
+        by: String,
+        /// score (default), n (certificates) or size
+        #[arg(long, default_value = "score", value_parser = ["score", "n", "size"])]
+        sort: String,
     },
     /// Certificate totals [cert_stats]
     Stats,
@@ -429,6 +507,9 @@ enum SeqCmd {
         /// First index for --part range
         #[arg(long, default_value_t = 0)]
         fr: u64,
+        /// Last index (inclusive) for --part range; default: to the end
+        #[arg(long)]
+        to: Option<u64>,
         #[arg(long = "type", visible_alias = "sequence", default_value = "aliquot", help = TYPE_HELP, value_name = "TYPE", value_parser = parse_seq_type)]
         kind: u8,
     },
@@ -465,6 +546,9 @@ enum SeqCmd {
         /// Only sequences on this aliquot driver (0 none, 1 downdriver, 2-5 named, 6 perfect)
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=6), value_name = "CODE")]
         driver: Option<u8>,
+        /// Only sequences whose frontier has exactly this guide value (finer than --driver)
+        #[arg(long, value_name = "GUIDE")]
+        guide: Option<u64>,
     },
     /// Which sequences a number is a term of [sequence_of]
     Of {
@@ -503,6 +587,9 @@ enum SeqCmd {
         /// Print the first factor found instead of reporting it, then stop
         #[arg(long)]
         no_submit: bool,
+        /// Credit the factors found to your account (see report --credit)
+        #[arg(long)]
+        credit: bool,
     },
     /// The type codes accepted by --type
     Types,
@@ -522,6 +609,15 @@ enum ConfigCmd {
     },
     /// Remove a setting
     Unset { key: ConfigKey },
+}
+
+/// What `fdb snfs` prints.
+#[derive(ValueEnum, Clone, Copy)]
+enum SnfsFormat {
+    List,
+    Ggnfs,
+    Msieve,
+    Cado,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -768,7 +864,7 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
         Cmd::Primality { target: t } => ctx.simple("primality", json!({ "target": target(&t)? })),
         Cmd::Algebraic { target: t } => ctx.simple("algebraic_factors", json!({ "target": target(&t)? })),
         Cmd::Family { expr, start, limit } => ctx.simple("get_family", json!({ "expr": expr, "start": start, "limit": limit })),
-        Cmd::Report { target: t, factors, file } => {
+        Cmd::Report { target: t, factors, file, credit } => {
             let mut list = factors;
             if let Some(f) = file {
                 for line in read_input(&f)?.lines() {
@@ -781,11 +877,71 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             if list.is_empty() {
                 return Err(Error::Usage("no factors given (pass them as arguments or with --file)".into()));
             }
-            ctx.simple_long("report_factors", json!({ "target": target(&t)?, "factors": list }))
+            let mut p = json!({ "target": target(&t)?, "factors": list });
+            if credit {
+                p["credit"] = json!(true);
+            }
+            ctx.simple_long("report_factors", p)
         }
+        Cmd::ReportFile { file, credit, batch, from_line, dry_run } => run_report_file(&ctx, &file, credit, batch, from_line, dry_run),
 
         // ---- proofs ----
         Cmd::Prove { target: t } => ctx.simple_long("prove", json!({ "target": target(&t)? })),
+        Cmd::CheckFactors { target: t, dry_run } => {
+            let mut p = json!({ "target": target(&t)? });
+            if dry_run {
+                p["dry_run"] = json!(true);
+            }
+            ctx.simple_long("check_factors", p)
+        }
+        Cmd::Snfs { target: t, format, poly, output } => {
+            let v = ctx.client.call("snfs_poly", json!({ "target": target(&t)? }))?;
+            let polys = v.get("polys").and_then(Value::as_array).cloned().unwrap_or_default();
+            if polys.is_empty() && !ctx.json {
+                return Err(Error::Failed("no SNFS polynomial for this number (it has no known special form)".into()));
+            }
+            let text = if ctx.json {
+                let mut s = if ctx.compact { v.to_string() } else { render::pretty(&v) };
+                s.push('\n');
+                s
+            } else {
+                let file = match format {
+                    SnfsFormat::List => None,
+                    SnfsFormat::Ggnfs => Some(snfs::FileFormat::Ggnfs),
+                    SnfsFormat::Msieve => Some(snfs::FileFormat::Msieve),
+                    SnfsFormat::Cado => Some(snfs::FileFormat::Cado),
+                };
+                match file {
+                    None => render::render("snfs_poly", &v),
+                    Some(f) => {
+                        let Some(p) = polys.get(poly) else {
+                            return Err(Error::Usage(format!("--poly {poly}: there are only {} polynomial(s), numbered from 0", polys.len())));
+                        };
+                        // The notes (prime, known factors, loses to GNFS) go into the file as comment
+                        // lines where the format has comments; msieve's .fb has none, so they go to
+                        // stderr there and the file stays loadable.
+                        let body = snfs::render_file(v.get("n").and_then(Value::as_str).unwrap_or(""), p, f);
+                        let notes = snfs::notes(&v);
+                        if matches!(f, snfs::FileFormat::Msieve) {
+                            for note in &notes {
+                                eprintln!("fdb: note: {note}");
+                            }
+                            body
+                        } else {
+                            notes.iter().map(|n| format!("# note: {n}\n")).collect::<String>() + &body
+                        }
+                    }
+                }
+            };
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, text)?;
+                    ctx.status(format!("written to {}", path.display()));
+                }
+                None => print!("{text}"),
+            }
+            Ok(())
+        }
         Cmd::ProofProgress { target: t } => ctx.simple_long("proof_progress", json!({ "target": target(&t)? })),
         Cmd::ProofState { target: t, wait, interval } => {
             let params = json!({ "target": target(&t)? });
@@ -848,12 +1004,16 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Download { table, digits, count, random, output } => {
+        Cmd::Download { table, digits, count, random, terms, output } => {
             let table = table_name(&table, &["C", "CF", "PRP", "U", "P"])?;
             if count == 0 || count > 50_000 {
                 return Err(Error::Usage(format!("--count must be between 1 and 50000, got {count}")));
             }
-            let v = ctx.client.call("download", json!({ "table": table, "digits": digits, "count": count, "random": random }))?;
+            let mut p = json!({ "table": table, "digits": digits, "count": count, "random": random });
+            if terms {
+                p["terms"] = json!(true);
+            }
+            let v = ctx.client.call("download", p)?;
             match output {
                 Some(path) => {
                     let mut text = if ctx.json { render::pretty(&v) } else { render::render("download", &v) };
@@ -947,6 +1107,7 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             if recognised { Ok(()) } else { Err(Error::Failed("token was not valid (already logged out or regenerated); nothing to invalidate".into())) }
         }
         Cmd::Quota => ctx.simple("quota_status", json!({})),
+        Cmd::Contributions { skip, limit } => ctx.simple("contributions", json!({ "skip": skip, "limit": limit })),
 
         // ---- utility ----
         Cmd::Health => ctx.simple("health", json!({})),
@@ -1040,11 +1201,22 @@ fn run_cert(ctx: &Ctx, c: CertCmd) -> Result<()> {
             Ok(())
         }
         CertCmd::Upload { files } => run_cert_upload(ctx, &files),
-        CertCmd::List { min_digits, pending, descending, skip, limit } => ctx.simple(
-            "cert_list",
-            json!({ "min_digits": min_digits, "pending": pending, "descending": descending, "skip": skip, "limit": limit }),
-        ),
-        CertCmd::Chain { target: t } => ctx.simple("cert_chain", json!({ "target": target(&t)? })),
+        CertCmd::List { min_digits, pending, descending, skip, limit, user, software } => {
+            let mut p = json!({ "min_digits": min_digits, "pending": pending, "descending": descending, "skip": skip, "limit": limit });
+            if let Some(u) = user {
+                p["user"] = json!(u);
+            }
+            if let Some(t) = software {
+                p["type"] = json!(t);
+            }
+            ctx.simple("cert_list", p)
+        }
+        CertCmd::Chain { target: t, skip, limit } => {
+            ctx.simple("cert_chain", json!({ "target": target(&t)?, "skip": skip, "limit": limit }))
+        }
+        CertCmd::Top { by, sort } => {
+            ctx.simple(if by == "software" { "cert_software_top" } else { "cert_top" }, json!({ "sort": sort }))
+        }
         CertCmd::Stats => ctx.simple("cert_stats", json!({})),
     }
 }
@@ -1157,16 +1329,23 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             let start = resolve_start(ctx, &start)?;
             ctx.simple("sequence_status", json!({ "start": start, "type": kind }))
         }
-        SeqCmd::View { start, part, fr, kind } => {
+        SeqCmd::View { start, part, fr, to, kind } => {
             let start = resolve_start(ctx, &start)?;
-            ctx.simple_long("sequence_view", json!({ "start": start, "type": kind, "part": part, "fr": fr }))
+            let mut p = json!({ "start": start, "type": kind, "part": part, "fr": fr });
+            if let Some(t) = to {
+                p["to"] = json!(t);
+            }
+            ctx.simple_long("sequence_view", p)
         }
         SeqCmd::Extend { start, steps, kind } => {
             let start = resolve_start(ctx, &start)?;
             ctx.simple_long("extend_sequence", json!({ "start": start, "steps": steps, "type": kind }))
         }
-        SeqCmd::List { limit, offset, kind, category, end, sort, dir, driver } => {
+        SeqCmd::List { limit, offset, kind, category, end, sort, dir, driver, guide } => {
             let mut p = json!({ "limit": limit, "offset": offset, "type": kind, "category": category });
+            if let Some(g) = guide {
+                p["guide"] = json!(g);
+            }
             if let Some(e) = end.filter(|e| e != "all") {
                 p["end_kind"] = Value::String(e);
             }
@@ -1182,7 +1361,7 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             ctx.simple("list_sequences", p)
         }
         SeqCmd::Of { target: t } => ctx.simple("sequence_of", json!({ "target": target(&t)? })),
-        SeqCmd::Advance { start, kind, threads, from, to, terms, max_digits, ecm, heartbeat, no_submit } => {
+        SeqCmd::Advance { start, kind, threads, from, to, terms, max_digits, ecm, heartbeat, no_submit, credit } => {
             let start_label = start.clone();
             let start = resolve_start(ctx, &start)?;
             let threads = threads
@@ -1204,6 +1383,7 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
                     ecm,
                     heartbeat: Duration::from_secs(heartbeat),
                     submit: !no_submit,
+                    credit,
                 },
             )
         }
@@ -1403,6 +1583,180 @@ fn parse_batch(text: &str) -> Result<Vec<Call>> {
     Ok(calls)
 }
 
+/// One report of a bulk factor file: the NUMBER=FACTOR lines of one number. Consecutive lines that
+/// name the same number are merged into one report (the server takes a list of factors).
+struct BulkReport {
+    /// First and last file line (1-based) the report was built from.
+    line: usize,
+    last_line: usize,
+    /// The number as written in the file, and as a call target.
+    number: String,
+    target: Value,
+    factors: Vec<String>,
+}
+
+/// Most factors merged into one report; a longer run of lines for one number starts another.
+const BULK_MAX_FACTORS: usize = 200;
+
+/// Parse a bulk factor file: one `NUMBER=FACTOR` per line, NUMBER an expression or a stored id
+/// (`#N`, `id:N`, `fid:N`), FACTOR a decimal or an expression. Blank lines are skipped, and so are
+/// comment lines - a `#` that is not followed by a digit (`#123=...` is an id line). Lines before
+/// `from_line` (1-based) are ignored. A malformed line is skipped: it is returned in the second list
+/// as `line N: <why>` and everything else is still submitted.
+fn parse_report_file(text: &str, from_line: usize) -> (Vec<BulkReport>, Vec<String>) {
+    let mut out: Vec<BulkReport> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = idx + 1;
+        if line < from_line {
+            continue;
+        }
+        let l = raw.trim().trim_start_matches('\u{feff}');
+        if l.is_empty() {
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix('#') {
+            if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+                continue; // a comment
+            }
+        }
+        let parsed = match l.split_once('=') {
+            None => Err("no '=' (expected NUMBER=FACTOR)".to_string()),
+            Some((num, fac)) => {
+                let (num, fac) = (num.trim(), fac.trim());
+                if num.is_empty() {
+                    Err("no number before '='".to_string())
+                } else if fac.is_empty() {
+                    Err("no factor after '='".to_string())
+                } else if fac.contains('=') {
+                    Err("more than one '='".to_string())
+                } else {
+                    match target(num) {
+                        Ok(t) => Ok((num, t, fac)),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            }
+        };
+        match parsed {
+            Err(why) => bad.push(format!("line {line}: {why}")),
+            Ok((num, t, fac)) => match out.last_mut() {
+                Some(prev) if prev.number == num && prev.factors.len() < BULK_MAX_FACTORS => {
+                    prev.factors.push(fac.to_string());
+                    prev.last_line = line;
+                }
+                _ => out.push(BulkReport { line, last_line: line, number: num.to_string(), target: t, factors: vec![fac.to_string()] }),
+            },
+        }
+    }
+    (out, bad)
+}
+
+/// `report-file`: submit the factors of a bulk file, `batch` numbers per round-trip. Malformed
+/// lines are skipped with a warning. A number whose report fails is shown and counted, and the run
+/// continues; a failure of the whole round-trip (rate limit, block, transport) stops it and names
+/// the line to resume from.
+fn run_report_file(ctx: &Ctx, file: &PathBuf, credit: bool, batch: usize, from_line: usize, dry_run: bool) -> Result<()> {
+    let text = read_input(file)?;
+    let (reports, skipped) = parse_report_file(&text, from_line.max(1));
+    // Malformed lines are ignored, not fatal: say which (the first 20) and carry on with the rest.
+    for why in skipped.iter().take(20) {
+        eprintln!("fdb: skipped {why}");
+    }
+    if skipped.len() > 20 {
+        eprintln!("fdb: ... and {} more malformed line(s) skipped", skipped.len() - 20);
+    }
+    let skip_note = if skipped.is_empty() { String::new() } else { format!(", {} malformed line(s) skipped", skipped.len()) };
+    if reports.is_empty() {
+        return Err(Error::Usage(format!("no usable NUMBER=FACTOR lines found{skip_note}")));
+    }
+    let total_factors: usize = reports.iter().map(|r| r.factors.len()).sum();
+    let short = |s: &str| -> String {
+        if s.chars().count() > 60 { format!("{}...", s.chars().take(57).collect::<String>()) } else { s.to_string() }
+    };
+    let lines_of = |r: &BulkReport| -> String {
+        if r.last_line == r.line { format!("line {}", r.line) } else { format!("lines {}-{}", r.line, r.last_line) }
+    };
+    if dry_run {
+        if ctx.json {
+            let items: Vec<Value> = reports
+                .iter()
+                .map(|r| json!({ "line": r.line, "number": r.number, "target": r.target, "factors": r.factors }))
+                .collect();
+            ctx.print_json(&Value::Array(items));
+        } else {
+            for r in &reports {
+                println!("{}: {}  {} factor(s)", lines_of(r), short(&r.number), r.factors.len());
+            }
+        }
+        ctx.status(format!("{total_factors} factor(s) for {} number(s){skip_note}; nothing submitted (--dry-run)", reports.len()));
+        return Ok(());
+    }
+    if credit {
+        // A stale token would be treated as anonymous and silently lose the credit of the whole file.
+        ctx.verify_token("report-file --credit")?;
+    }
+    let (mut done, mut failed, mut new_ids, mut credited) = (0usize, 0usize, 0u64, 0u64);
+    let mut items: Vec<Value> = Vec::new();
+    let mut stopped: Option<(Error, usize)> = None;
+    for chunk in reports.chunks(batch.max(1)) {
+        let calls: Vec<Call> = chunk
+            .iter()
+            .map(|r| {
+                let mut p = json!({ "target": r.target, "factors": r.factors });
+                if credit {
+                    p["credit"] = json!(true);
+                }
+                Call { method: "report_factors".to_string(), params: p }
+            })
+            .collect();
+        let results = match ctx.client.batch(&calls) {
+            Ok(r) => r,
+            Err(e) => {
+                stopped = Some((e, chunk[0].line));
+                break;
+            }
+        };
+        let mut results = results.into_iter();
+        for r in chunk {
+            match results.next().unwrap_or_else(|| Err(Error::Transport("no reply for this report".into()))) {
+                Ok(v) => {
+                    done += 1;
+                    new_ids += v.get("created_ids").and_then(Value::as_array).map_or(0, |a| a.len() as u64);
+                    credited += v.get("credited").and_then(Value::as_u64).unwrap_or(0);
+                    if ctx.json {
+                        items.push(json!({ "line": r.line, "number": r.number, "factors": r.factors, "result": v }));
+                    } else {
+                        println!("{}: {}  ->  {}", lines_of(r), short(&r.number), render::report_line(&v));
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("fdb: {}: {}: {e}", lines_of(r), short(&r.number));
+                    let err = match &e {
+                        Error::Rpc { code, message } => json!({ "code": code, "message": message }),
+                        other => json!({ "message": other.to_string() }),
+                    };
+                    items.push(json!({ "line": r.line, "number": r.number, "factors": r.factors, "error": err }));
+                }
+            }
+        }
+    }
+    if ctx.json {
+        ctx.print_json(&Value::Array(items));
+    }
+    let credit_note = if credit { format!(", {credited} factor(s) credited") } else { String::new() };
+    ctx.status(format!(
+        "{done} of {} number(s) reported ({total_factors} factor line(s) in the file), {failed} failed, {new_ids} new id(s){credit_note}{skip_note}",
+        reports.len()
+    ));
+    if let Some((e, line)) = stopped {
+        eprintln!("fdb: stopped before line {line}: {e}\nfdb: resume with --from-line {line}");
+        return Err(e);
+    }
+    if failed > 0 { Err(Error::Failed(format!("{failed} of {} reports failed", reports.len()))) } else { Ok(()) }
+}
+
 fn read_input(path: &PathBuf) -> Result<String> {
     if path.as_os_str() == "-" {
         let mut s = String::new();
@@ -1421,6 +1775,16 @@ fn prompt_password(prompt: &str) -> Result<String> {
         std::io::stdin().read_line(&mut s)?;
         Ok(s.trim_end_matches(['\r', '\n']).to_string())
     }
+}
+
+/// The `--type` name of a sequence type code (e.g. 10 -> hp10), or the bare code when it is not in
+/// the catalogue. Used by the renderer for the type column of a membership list.
+fn seq_type_label(code: u64) -> String {
+    seq_type_catalog()
+        .into_iter()
+        .find(|(c, _, _)| u64::from(*c) == code)
+        .map(|(_, name, _)| name)
+        .unwrap_or_else(|| code.to_string())
 }
 
 /// The sequence-type catalogue: (code, short name, description). Codes match the core's
@@ -1459,8 +1823,27 @@ fn seq_type_catalog() -> Vec<(u8, String, String)> {
         (59, "biunitary", "Bi-unitary aliquot: sigma**(n) - n"),
         (60, "exponential", "Exponential aliquot: sigma^(e)(n) - n"),
         (61, "infinitary", "Infinitary aliquot: sigma_inf(n) - n"),
+        (122, "sigma-1", "sigma(n) - 1 until a prime (A039654)"),
+        (123, "phi+1", "phi(n) + 1 until a prime (A039650)"),
+        (124, "cototient", "Cototient n - phi(n) until a power of two (A051953)"),
     ] {
         rows.push((code, name.into(), label.into()));
+    }
+    // Conway's "climb to a prime" (A080670 family), every base: codes 87..=121 (code = base + 85).
+    for b in 2..=36u8 {
+        rows.push((85 + b, format!("climb{b}"), format!("Conway's climb to a prime (primes with exponents), base {b}")));
+    }
+    // The other concatenation rules on bases 2, 3, 8, 10, 16: codes 125..=144, five per rule.
+    const CONCAT_BASES: [u8; 5] = [2, 3, 8, 10, 16];
+    for (first, name, label) in [
+        (125u8, "dhp", "Distinct-prime home prime"),
+        (130, "dihp", "Distinct-prime home prime, descending"),
+        (135, "schp", "Second-class home prime (one least prime dropped)"),
+        (140, "mdc", "Mid-divisor concatenation"),
+    ] {
+        for (i, b) in CONCAT_BASES.iter().enumerate() {
+            rows.push((first + i as u8, format!("{name}{b}"), format!("{label}, base {b}")));
+        }
     }
     rows.sort_by_key(|(code, _, _)| *code);
     rows
@@ -1500,14 +1883,15 @@ fn print_seq_types() {
 
 /// Command groups in display order; every visible subcommand must appear here (checked in tests).
 const GROUPS: &[(&str, &[&str])] = &[
-    ("Numbers & factors", &["id", "number", "factors", "factor-of", "nextprime", "prevprime", "primality", "algebraic", "family", "report"]),
+    ("Numbers & factors", &["id", "number", "factors", "factor-of", "nextprime", "prevprime", "primality", "algebraic", "family", "report", "report-file"]),
     ("Primality proofs", &["prove", "proof-progress", "proof-state", "proof-list"]),
+    ("Factoring", &["check-factors", "snfs"]),
     ("Probable-prime tests", &["prp-test", "prp-test-info"]),
     ("Certificates", &["cert"]),
     ("Sequences", &["seq"]),
     ("Statistics & listings", &["status", "stats", "smallest", "comb-progress", "digit-distribution", "factor-tables", "list", "ecm-list"]),
     ("Tools & downloads", &["ecm-group-order", "download"]),
-    ("Account", &["login", "register", "whoami", "regenerate-token", "logout", "quota"]),
+    ("Account", &["login", "register", "whoami", "regenerate-token", "logout", "quota", "contributions"]),
     ("Utility", &["health", "call", "batch", "config"]),
 ];
 
@@ -1693,6 +2077,41 @@ fn wrap_first(o: &mut String, first: &str, text: &str, indent: usize, width: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bulk factor file: ids and expressions, comments vs. `#id` lines, merging of consecutive
+    /// lines for one number, --from-line, and malformed lines being skipped (the rest still parses).
+    #[test]
+    fn report_file_parses_numbers_ids_and_comments() {
+        let text = "# a comment\n\n2^67-1=193707721\n2^67-1 = 761838257287\n#1100000000000000123=1009\n  id:77=3\n10^20+1=73\n2^67-1=193707721\n";
+        let (r, bad) = parse_report_file(text, 1);
+        assert!(bad.is_empty());
+        assert_eq!(r.len(), 5);
+        assert_eq!((r[0].line, r[0].last_line), (3, 4));
+        assert_eq!(r[0].number, "2^67-1");
+        assert_eq!(r[0].factors, vec!["193707721", "761838257287"]);
+        assert_eq!(r[0].target, json!({ "expr": "2^67-1" }));
+        assert_eq!(r[1].target, json!({ "id": 1100000000000000123u64 }));
+        assert_eq!(r[1].factors, vec!["1009"]);
+        assert_eq!(r[2].target, json!({ "id": 77 }));
+        assert_eq!(r[3].target, json!({ "expr": "10^20+1" }));
+        // Not consecutive with the first two 2^67-1 lines: its own report.
+        assert_eq!((r[4].line, r[4].number.as_str()), (8, "2^67-1"));
+
+        // --from-line skips the lines before it.
+        let (r, _) = parse_report_file(text, 5);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0].line, 5);
+
+        // A bad line is skipped and named; the good lines around it are kept.
+        for (bad, what) in [("2^67-1\n", "no '='"), ("=5\n", "no number"), ("12=\n", "no factor"), ("#12x=5\n", "an id must be"), ("1=2=3\n", "more than one")] {
+            let (r, skipped) = parse_report_file(&format!("7=7\n{bad}9=3\n"), 1);
+            assert_eq!(r.iter().map(|x| x.number.as_str()).collect::<Vec<_>>(), vec!["7", "9"], "{bad:?}");
+            assert_eq!(skipped.len(), 1);
+            assert!(skipped[0].starts_with("line 2:") && skipped[0].contains(what), "{bad:?} -> {}", skipped[0]);
+        }
+        let (r, skipped) = parse_report_file("# only comments\n\n", 1);
+        assert!(r.is_empty() && skipped.is_empty());
+    }
 
     /// Every visible subcommand is placed in a reference group (so nothing is left undocumented).
     #[test]

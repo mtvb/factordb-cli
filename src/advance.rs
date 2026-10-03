@@ -62,6 +62,8 @@ pub struct Opts {
     pub ecm: String,
     pub heartbeat: Duration,
     pub submit: bool,
+    /// Ask the service to credit each reported factor to the account behind the token.
+    pub credit: bool,
 }
 
 /// A composite leaf of the last term: what to run ECM on and how to address it when reporting.
@@ -221,9 +223,17 @@ pub fn run(ctx: &Ctx, o: &Opts) -> Result<()> {
                     reported: None,
                 };
                 if o.submit {
-                    let r = ctx.client.call_long("report_factors", json!({ "target": leaf.target(), "factors": [factor] }))?;
+                    let mut p = json!({ "target": leaf.target(), "factors": [factor] });
+                    if o.credit {
+                        p["credit"] = json!(true);
+                    }
+                    let r = ctx.client.call_long("report_factors", p)?;
                     let st = r["status"].as_str().unwrap_or("?").to_string();
-                    say(format!("  reported to the service: composite is now {st}"));
+                    let credited = r["credited"].as_u64().unwrap_or(0);
+                    say(format!(
+                        "  reported to the service: composite is now {st}{}",
+                        if credited > 0 { format!(", {credited} factor credited to your account") } else { String::new() }
+                    ));
                     rec.reported = Some(st);
                     found.push(rec);
                 } else {
