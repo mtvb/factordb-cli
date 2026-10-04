@@ -49,6 +49,7 @@ pub fn render(method: &str, v: &Value) -> String {
         "digit_distribution" => r_digit_dist(&mut o, v),
         "factor_tables" => r_factor_tables(&mut o, v),
         "list_by_type" => r_list_by_type(&mut o, v),
+        "prp_candidates" => r_prp_candidates(&mut o, v),
         "ecm_list" => r_ecm_list(&mut o, v),
         "ecm_group_order" => r_group_order(&mut o, v),
         "download" => r_download(&mut o, v),
@@ -1422,6 +1423,26 @@ fn r_list_by_type(o: &mut String, v: &Value) {
         o.push_str("(no rows)\n");
     } else {
         table(o, &["id", "digits", "number"], &rows, 0);
+    }
+    if b(v, "has_more") {
+        o.push_str("(more rows available, raise --offset)\n");
+    }
+}
+
+/// Probable primes by how far N-1 / N+1 are factored (hundredths of a percent on the wire); a
+/// `*` marks a side that is factored far enough for a proof.
+fn r_prp_candidates(o: &mut String, v: &Value) {
+    let pct = |r: &Value, key: &str, bit: u64| -> String {
+        format!("{:.2}%{}", u(r, key) as f64 / 100.0, if u(r, "ready") & bit != 0 { "*" } else { "" })
+    };
+    let rows: Vec<Vec<String>> = arr(v, "rows")
+        .iter()
+        .map(|r| vec![fid_label(r, "fid"), commas(u(r, "digits")), pct(r, "nm1", 1), pct(r, "np1", 2), pct(r, "comb", 4), number_text(r)])
+        .collect();
+    if rows.is_empty() {
+        o.push_str("(no rows)\n");
+    } else {
+        table(o, &["id", "digits", "N-1", "N+1", "combined", "number"], &rows, 0);
     }
     if b(v, "has_more") {
         o.push_str("(more rows available, raise --offset)\n");

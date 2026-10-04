@@ -287,6 +287,17 @@ enum Cmd {
         /// Maximum 1000
         #[arg(long, default_value_t = 100)]
         limit: u64,
+        /// PRP only: order by how far N-1 / N+1 are factored, most factored first - best (the
+        /// better side), nm1, np1 or combined - instead of smallest first [prp_candidates]
+        #[arg(long, value_name = "ORDER")]
+        sort: Option<String>,
+        /// With --sort: only numbers of at most this many digits (0 = no bound)
+        #[arg(long, default_value_t = 0)]
+        max_digits: u64,
+        /// With --sort: include the numbers a proof is possible for already (N-1 or N+1 past one
+        /// third, or the combined test; `fdb prove` proves those)
+        #[arg(long)]
+        all: bool,
     },
     /// Factors found by ECM / P-1 / P+1 [ecm_list]
     EcmList {
@@ -986,9 +997,19 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
         Cmd::CombProgress => ctx.simple("comb_progress", json!({})),
         Cmd::DigitDistribution { start, count } => ctx.simple("digit_distribution", json!({ "start": start, "count": count })),
         Cmd::FactorTables => ctx.simple("factor_tables", json!({})),
-        Cmd::List { table, min_digits, offset, limit } => {
+        Cmd::List { table, min_digits, offset, limit, sort, max_digits, all } => {
             let table = table_name(&table, &["P", "PRP", "C", "U", "CF"])?;
-            ctx.simple("list_by_type", json!({ "table": table, "min_digits": min_digits, "offset": offset, "limit": limit }))
+            match sort.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                None | Some("digits") => {
+                    ctx.simple("list_by_type", json!({ "table": table, "min_digits": min_digits, "offset": offset, "limit": limit }))
+                }
+                Some(order @ ("best" | "nm1" | "np1" | "combined")) if table == "PRP" => ctx.simple(
+                    "prp_candidates",
+                    json!({ "sort": order, "min_digits": min_digits, "max_digits": max_digits, "open": !all, "offset": offset, "limit": limit }),
+                ),
+                Some("best" | "nm1" | "np1" | "combined") => Err(Error::Usage("--sort by N-1 / N+1 factorization is for the PRP table".into())),
+                Some(other) => Err(Error::Usage(format!("unknown --sort '{other}' (digits, best, nm1, np1, combined)"))),
+            }
         }
         Cmd::EcmList { type_id, min_digits, by_time, descending, skip, limit } => ctx.simple(
             "ecm_list",
