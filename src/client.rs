@@ -107,6 +107,44 @@ impl Client {
         out.pop().unwrap_or(Err(Error::Transport("empty response".into())))
     }
 
+    /// Stream a file the server serves next to the RPC endpoint (e.g. `/cert/<fid>`, the stored
+    /// certificate as plain text) into `w`; returns the bytes written. The address is the RPC URL
+    /// with its `/rpc` path replaced, so it follows `--url`. A 404 is `Error::Failed` with the
+    /// server's one-line answer.
+    pub fn download(&self, path: &str, w: &mut dyn std::io::Write) -> Result<u64> {
+        let base = self.url.trim_end_matches('/').trim_end_matches("/rpc").to_string();
+        let url = format!("{base}{path}");
+        let t0 = std::time::Instant::now();
+        if self.verbose {
+            eprintln!("> GET {url}");
+        }
+        let mut req = self.agent.get(&url).config().timeout_global(self.long_timeout).build();
+        if let Some(t) = &self.token {
+            if !t.is_empty() {
+                req = req.header("X-Fdb-User-Token", t);
+            }
+        }
+        let mut resp = req.call().map_err(|e| Error::Transport(format!("{url}: {}", describe(e))))?;
+        let status = resp.status().as_u16();
+        if self.verbose {
+            eprintln!("< HTTP {status} in {:.1} ms (streaming)", t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        if !(200..=299).contains(&status) {
+            let text = resp.body_mut().with_config().limit(64 * 1024).read_to_string().unwrap_or_default();
+            let msg = text.trim().to_string();
+            return Err(match status {
+                404 => Error::Failed(if msg.is_empty() { "not found".into() } else { msg }),
+                429 => Error::Limited { message: msg, retry_after: None },
+                403 => Error::Blocked(msg),
+                _ => Error::Transport(format!("{url}: HTTP {status} {msg}")),
+            });
+        }
+        let mut reader = resp.body_mut().as_reader();
+        let n = std::io::copy(&mut reader, w).map_err(|e| Error::Transport(format!("{url}: reading: {e}")))?;
+        w.flush().map_err(|e| Error::Transport(format!("writing: {e}")))?;
+        Ok(n)
+    }
+
     /// A single call that may take long on the server (a write); uses the long timeout.
     pub fn call_long(&self, method: &str, params: Value) -> Result<Value> {
         let mut out = self.send(&[Call { method: method.to_string(), params }], false, true)?;

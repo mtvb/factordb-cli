@@ -1313,6 +1313,9 @@ fn r_comb_progress(o: &mut String, v: &Value, indent: usize) {
 }
 
 fn r_status(o: &mut String, v: &Value) {
+    if let Some(c) = v.get("calls_per_sec").and_then(Value::as_f64) {
+        o.push_str(&format!("rpc calls per second (last minute)  {c:.1}\n\n"));
+    }
     o.push_str("tables\n");
     if let Some(st) = v.get("stats") {
         stats_kv(st).write(o, 2);

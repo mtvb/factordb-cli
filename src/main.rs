@@ -1194,11 +1194,20 @@ fn run_cert(ctx: &Ctx, c: CertCmd) -> Result<()> {
                 return Err(Error::Failed(format!("no certificate stored for {t}")));
             }
             let data = v.get("data").and_then(Value::as_str);
+            // Above the RPC's inline limit the certificate is streamed from the server's file
+            // address instead (nothing is held in memory on either side).
+            let stream_path = v.get("fid").and_then(Value::as_str).map(|f| format!("/cert/{f}"));
             let too_large = || Error::Failed("certificate is too large to be returned by the RPC".into());
             match output {
                 Some(path) => {
-                    let Some(d) = data else { return Err(too_large()) };
-                    std::fs::write(&path, d)?;
+                    match data {
+                        Some(d) => std::fs::write(&path, d)?,
+                        None => {
+                            let Some(sp) = stream_path else { return Err(too_large()) };
+                            let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
+                            ctx.client.download(&sp, &mut f)?;
+                        }
+                    }
                     if ctx.json {
                         let mut meta = v.clone();
                         meta.as_object_mut().map(|m| m.remove("data"));
@@ -1214,8 +1223,14 @@ fn run_cert(ctx: &Ctx, c: CertCmd) -> Result<()> {
                     } else {
                         eprint!("{}", render::render("get_certificate", &v));
                         // The stored bytes, exactly: no newline is added, so stdout and -o agree.
-                        let Some(d) = data else { return Err(too_large()) };
-                        std::io::stdout().lock().write_all(d.as_bytes())?;
+                        match data {
+                            Some(d) => std::io::stdout().lock().write_all(d.as_bytes())?,
+                            None => {
+                                let Some(sp) = stream_path else { return Err(too_large()) };
+                                let mut out = std::io::stdout().lock();
+                                ctx.client.download(&sp, &mut out)?;
+                            }
+                        }
                     }
                 }
             }
