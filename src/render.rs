@@ -96,6 +96,20 @@ fn i(v: &Value, k: &str) -> i64 {
 fn b(v: &Value, k: &str) -> bool {
     v.get(k).and_then(Value::as_bool).unwrap_or(false)
 }
+fn created_label(c: &str) -> String {
+    if let Some(d) = c.strip_prefix('<') {
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let mut it = d.split('-');
+        if let (Some(y), Some(m)) = (it.next(), it.next().and_then(|m| m.parse::<usize>().ok())) {
+            if (1..=12).contains(&m) {
+                return format!("before {} {y}", MONTHS[m - 1]);
+            }
+        }
+        return format!("before {d}");
+    }
+    c.to_string()
+}
+
 fn has(v: &Value, k: &str) -> bool {
     v.get(k).is_some_and(|x| !x.is_null())
 }
@@ -490,6 +504,8 @@ fn r_number(o: &mut String, v: &Value) {
         kv.add("decimal", "(omitted: too large to inline)");
     }
     kv.add_if(has(v, "info"), "info", s(v, "info"));
+    kv.add_if(has(v, "created"), "created", created_label(&s(v, "created")));
+    kv.add_if(has(v, "import_source"), "imported from", s(v, "import_source"));
     kv.write(o, 0);
     // Scanner effort: the core sends ONE integer (the Upile queue level, C/U only, detail>=2); the
     // trial-division bound and gmp-ecm stages are derived here, exactly as the website does.
