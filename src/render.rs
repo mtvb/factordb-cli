@@ -250,6 +250,12 @@ fn seq_base(n: u64) -> String {
     if n > STARTDB { format!("#{n}") } else { commas(n) }
 }
 
+fn seq_base_exp(v: &Value, id_key: &str, exp_key: &str) -> String {
+    let base = seq_base(u(v, id_key));
+    let exp = u(v, exp_key);
+    if exp > 1 { format!("{base}^{exp}") } else { base }
+}
+
 fn end_str(e: &Value) -> String {
     match s(e, "kind") {
         "open" => "open".into(),
@@ -258,7 +264,7 @@ fn end_str(e: &Value) -> String {
             if base == 1 {
                 "terminates (reaches 1)".into()
             } else {
-                format!("merges into {} at index {}", seq_base(base), u(e, "at"))
+                format!("merges into {} at index {}", seq_base_exp(e, "base", "exp"), u(e, "at"))
             }
         }
         "cycle" => format!("cycle of length {}", u(e, "len")),
@@ -581,6 +587,7 @@ fn primality_kv(v: &Value) -> Kv {
         "cert_pending" => "certificate uploaded, verification pending",
         "direct" => "proven directly",
         "certificate" => "proven by primality certificate",
+        "chain_step" => "proven as a step of another number's certificate chain",
         "n-1" => "Pocklington N-1 proof",
         "n+1" => "Morrison N+1 proof",
         "combined" => "combined N-1 / N+1 (BLS75) proof",
@@ -597,6 +604,11 @@ fn primality_kv(v: &Value) -> Kv {
     kv.add_if(has(v, "cert_digits"), "cert digits", commas(u(v, "cert_digits")));
     kv.add_if(has(v, "cert_type"), "cert type", n(v, "cert_type"));
     kv.add_if(has(v, "cert_processing"), "cert state", if b(v, "cert_processing") { "being verified" } else { "queued" });
+    // A chain step: whose certificate, which step of how many recorded ones.
+    if has(v, "chain_fid") {
+        kv.add("certificate of", format!("#{} ({} digits)", u(v, "chain_fid"), commas(u(v, "chain_digits"))));
+        kv.add("chain step", format!("{} of {}", commas(u(v, "chain_step")), commas(u(v, "chain_steps"))));
+    }
     // A second recorded proof next to a certificate (N-1 / N+1 / combined), with its witness base.
     if let Some(a) = v.get("also_proof") {
         let ak = s(a, "kind");
@@ -639,21 +651,31 @@ fn r_algebraic(o: &mut String, v: &Value, indent: usize) {
 }
 
 fn r_family(o: &mut String, v: &Value) {
+    // With --factors the server folds each member's factorization in: one more column, the
+    // factors as base^exp with a status tag on anything but a proven prime (like `seq get`).
+    let with_factors = arr(v, "members").iter().any(|m| has(m, "factors"));
     let rows: Vec<Vec<String>> = arr(v, "members")
         .iter()
         .map(|m| {
             let x = n(m, "x");
-            match m.get("member") {
+            let mut row = match m.get("member") {
                 Some(mem) if !mem.is_null() => {
                     let id = mem.get("id").cloned().unwrap_or(Value::Null);
                     vec![x, id_label(&id), s(mem, "status").to_string(), commas(u(mem, "digits"))]
                 }
                 _ => vec![x, "-".into(), "-".into(), "-".into()],
+            };
+            if with_factors {
+                let fs: Vec<String> = arr(m, "factors").iter().map(factor_str).collect();
+                row.push(if fs.is_empty() { "-".into() } else { fs.join(" * ") });
             }
+            row
         })
         .collect();
     if rows.is_empty() {
         o.push_str("(no members)\n");
+    } else if with_factors {
+        table(o, &["x", "id", "status", "digits", "factors"], &rows, 0);
     } else {
         table(o, &["x", "id", "status", "digits"], &rows, 0);
     }
@@ -1075,7 +1097,7 @@ fn seq_terms(o: &mut String, terms: &[Value], indent: usize) {
 
 fn r_seq_get(o: &mut String, v: &Value) {
     let mut kv = Kv::new();
-    kv.add("base", seq_base(u(v, "base")));
+    kv.add("base", seq_base_exp(v, "base", "base_exp"));
     kv.add("base index", n(v, "base_index"));
     kv.add("length", commas(u(v, "length")));
     kv.add("end", end_str(v.get("end").unwrap_or(&Value::Null)));
@@ -1091,7 +1113,7 @@ fn r_seq_get(o: &mut String, v: &Value) {
 
 fn r_seq_sizes(o: &mut String, v: &Value) {
     let mut kv = Kv::new();
-    kv.add("base", seq_base(u(v, "base")));
+    kv.add("base", seq_base_exp(v, "base", "base_exp"));
     kv.add("base index", n(v, "base_index"));
     kv.add("length", commas(u(v, "length")));
     kv.add("end", end_str(v.get("end").unwrap_or(&Value::Null)));
@@ -1150,7 +1172,7 @@ fn r_seq_sizes(o: &mut String, v: &Value) {
 
 fn r_seq_status(o: &mut String, v: &Value, indent: usize) {
     let mut kv = Kv::new();
-    kv.add("base", seq_base(u(v, "base")));
+    kv.add("base", seq_base_exp(v, "base", "base_exp"));
     kv.add("length", commas(u(v, "length")));
     kv.add("end", end_str(v.get("end").unwrap_or(&Value::Null)));
     kv.add("own length", commas(u(v, "own_length")));
@@ -1168,7 +1190,7 @@ fn r_seq_status(o: &mut String, v: &Value, indent: usize) {
     kv.write(o, indent);
     let merges = arr(v, "merges");
     if !merges.is_empty() {
-        let rows: Vec<Vec<String>> = merges.iter().map(|m| vec![n(m, "at"), seq_base(u(m, "base")), n(m, "into_at")]).collect();
+        let rows: Vec<Vec<String>> = merges.iter().map(|m| vec![n(m, "at"), seq_base_exp(m, "base", "exp"), n(m, "into_at")]).collect();
         let _ = writeln!(o, "{}merge crossings along the walk:", " ".repeat(indent));
         table(o, &["at index", "into sequence", "at its index"], &rows, indent);
     }
@@ -1198,8 +1220,8 @@ fn r_seq_view(o: &mut String, v: &Value) {
 
 fn r_seq_extend(o: &mut String, v: &Value) {
     let mut kv = Kv::new();
-    kv.add("base", seq_base(u(v, "base")));
-    kv.add("computed to", commas(u(v, "computed_to")));
+    kv.add("base", seq_base_exp(v, "base", "base_exp"));
+    kv.add("computed to", seq_base_exp(v, "computed_to", "computed_to_exp"));
     kv.add("length", commas(u(v, "length")));
     kv.add("end", end_str(v.get("end").unwrap_or(&Value::Null)));
     kv.write(o, 0);
@@ -1245,10 +1267,17 @@ fn r_seq_list(o: &mut String, v: &Value) {
     let rows: Vec<Vec<String>> = arr(v, "sequences")
         .iter()
         .map(|q| {
-            let start = if has(q, "start") { s(q, "start").to_string() } else { format!("#{}", u(q, "start_id")) };
+            let start = if has(q, "start") { s(q, "start").to_string() } else { seq_base_exp(q, "start_id", "start_exp") };
             let end = q.get("end").cloned().unwrap_or(Value::Null);
             let end_txt = if s(&end, "kind") == "merge" && has(q, "merge_base") {
-                format!("merges into {} at index {}", s(q, "merge_base"), u(&end, "at"))
+                // trunk_end: what the trunk this one ends in ends in (open / cycle / terminus)
+                let trunk = match s(q, "trunk_end") {
+                    "open" => ", trunk open",
+                    "cycle" => ", trunk cycles",
+                    "terminus" => ", trunk terminates",
+                    _ => "",
+                };
+                format!("merges into {} at index {}{trunk}", s(q, "merge_base"), u(&end, "at"))
             } else {
                 end_str(&end)
             };
@@ -1269,7 +1298,7 @@ fn r_seq_of(o: &mut String, v: &Value, indent: usize) {
     let rows: Vec<Vec<String>> = arr(v, "sequences")
         .iter()
         .map(|m| {
-            let start = if has(m, "start") { s(m, "start").to_string() } else { format!("#{}", u(m, "start_id")) };
+            let start = if has(m, "start") { s(m, "start").to_string() } else { seq_base_exp(m, "start_id", "start_exp") };
             let kind = if has(m, "type") { crate::seq_type_label(u(m, "type")) } else { "aliquot".to_string() };
             vec![kind, start, n(m, "index"), commas(u(m, "length")), end_str(m.get("end").unwrap_or(&Value::Null))]
         })

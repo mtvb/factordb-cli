@@ -138,6 +138,9 @@ enum Cmd {
         /// How many members to list
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Also show each member's factorization
+        #[arg(long)]
+        factors: bool,
     },
     /// Submit found factors of a number; each is verified exactly [report_factors]
     Report {
@@ -546,7 +549,7 @@ enum SeqCmd {
         #[arg(long, default_value_t = 0)]
         category: u8,
         /// Only sequences ending this way
-        #[arg(long, value_parser = ["open", "merge", "cycle", "terminus", "all"], value_name = "KIND")]
+        #[arg(long, value_parser = ["open", "merge", "cycle", "terminus", "all", "merge-open", "merge-terminus", "merge-cycle"], value_name = "KIND")]
         end: Option<String>,
         /// Sort column
         #[arg(long, value_parser = ["length", "start", "driver"])]
@@ -874,7 +877,7 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
         Cmd::FactorOf { target: t, limit } => ctx.simple("factor_of", json!({ "target": target(&t)?, "limit": limit })),
         Cmd::Primality { target: t } => ctx.simple("primality", json!({ "target": target(&t)? })),
         Cmd::Algebraic { target: t } => ctx.simple("algebraic_factors", json!({ "target": target(&t)? })),
-        Cmd::Family { expr, start, limit } => ctx.simple("get_family", json!({ "expr": expr, "start": start, "limit": limit })),
+        Cmd::Family { expr, start, limit, factors } => ctx.simple("get_family", json!({ "expr": expr, "start": start, "limit": limit, "factors": factors })),
         Cmd::Report { target: t, factors, file, credit } => {
             let mut list = factors;
             if let Some(f) = file {
@@ -1001,7 +1004,11 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             let table = table_name(&table, &["P", "PRP", "C", "U", "CF"])?;
             match sort.as_deref().map(str::to_ascii_lowercase).as_deref() {
                 None | Some("digits") => {
-                    ctx.simple("list_by_type", json!({ "table": table, "min_digits": min_digits, "offset": offset, "limit": limit }))
+                    let mut params = json!({ "table": table, "min_digits": min_digits, "offset": offset, "limit": limit });
+                    if max_digits > 0 {
+                        params["max_digits"] = json!(max_digits);   // upper bound, same as with --sort
+                    }
+                    ctx.simple("list_by_type", params)
                 }
                 Some(order @ ("best" | "nm1" | "np1" | "combined")) if table == "PRP" => ctx.simple(
                     "prp_candidates",
