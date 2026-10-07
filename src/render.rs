@@ -446,7 +446,26 @@ fn factor_base(f: &Value) -> String {
 
 /// One factor as base^exp[status] - the status tag is shown for anything but a proven prime.
 fn factor_str(f: &Value) -> String {
-    let mut t = factor_base(f);
+    factor_with_base(f, factor_base(f))
+}
+
+/// One factor of a table cell: like `factor_str`, but a base over 24 digits is shortened to
+/// "head…tail<digits>" so a 200-digit composite keeps the table readable.
+fn factor_cell(f: &Value) -> String {
+    let digits = u(f, "digits");
+    if digits <= 24 {
+        return factor_str(f);
+    }
+    let base = s(f, "base");
+    // A base over 1000 digits arrives as a leading preview with its last digits in `tail`.
+    let tail_src = if s(f, "tail").is_empty() { base } else { s(f, "tail") };
+    let head: String = base.chars().take(10).collect();
+    let tail: String = tail_src.chars().skip(tail_src.chars().count().saturating_sub(2)).collect();
+    factor_with_base(f, format!("{head}…{tail}<{digits}>"))
+}
+
+/// `base` followed by the factor's exponent (when above 1) and status tag (for anything but P).
+fn factor_with_base(f: &Value, mut t: String) -> String {
     let e = u(f, "exponent");
     if e > 1 {
         let _ = write!(t, "^{e}");
@@ -1281,14 +1300,27 @@ fn r_seq_list(o: &mut String, v: &Value) {
             } else {
                 end_str(&end)
             };
-            let comp = if has(q, "composite") { format!("{} ({}d)", truncate(s(q, "composite"), 24), u(q, "composite_digits")) } else { "-".into() };
-            vec![start, commas(u(q, "digits")), commas(u(q, "length")), end_txt, comp, seq_driver_cell(q)]
+            // An open sequence's last term: its id and its factors; the sizes of its unfactored
+            // composites (the [C]/[U] factors) are derived here.
+            let factors = arr(q, "factors");
+            let (last, facs, cdigits) = if has(q, "last_id") {
+                let mut d: Vec<u64> = factors.iter().filter(|f| matches!(s(f, "status"), "C" | "U")).map(|f| u(f, "digits")).collect();
+                d.sort_unstable_by(|a, b| b.cmp(a));
+                let fs = if factors.is_empty() { "-".into() } else { factors.iter().map(factor_cell).collect::<Vec<_>>().join(" * ") };
+                let ds = if d.is_empty() { "-".into() } else { d.iter().map(|x| commas(*x)).collect::<Vec<_>>().join(", ") };
+                (seq_base_exp(q, "last_id", "last_exp"), fs, ds)
+            } else if has(q, "composite") {
+                ("-".into(), truncate(s(q, "composite"), 24), commas(u(q, "composite_digits")))
+            } else {
+                ("-".into(), "-".into(), "-".into())
+            };
+            vec![start, commas(u(q, "digits")), commas(u(q, "length")), end_txt, last, facs, cdigits, seq_driver_cell(q)]
         })
         .collect();
     if rows.is_empty() {
         o.push_str("(no sequences)\n");
     } else {
-        table(o, &["start", "digits", "length", "end", "last composite", "driver"], &rows, 0);
+        table(o, &["start", "digits", "length", "end", "last term", "factorization", "composite digits", "driver"], &rows, 0);
     }
 }
 
