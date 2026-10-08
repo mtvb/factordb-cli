@@ -714,6 +714,10 @@ pub fn report_line(v: &Value) -> String {
 
 /// A check_factors result: what step ran (or would run), the factors found, the level afterwards.
 fn r_check_factors(o: &mut String, v: &Value) {
+    check_factors_kv(v).write(o, 0);
+}
+
+fn check_factors_kv(v: &Value) -> Kv {
     let mut kv = Kv::new();
     kv.add("number", format!("#{}", s(v, "fid")));
     kv.add("digits", commas(u(v, "digits")));
@@ -729,7 +733,7 @@ fn r_check_factors(o: &mut String, v: &Value) {
         kv.add("factors found", if fs.is_empty() { "none".to_string() } else { fs.join(", ") });
     }
     kv.add("level", n(v, "level"));
-    kv.write(o, 0);
+    kv
 }
 
 fn r_report(o: &mut String, v: &Value) {
@@ -1189,13 +1193,43 @@ fn r_seq_sizes(o: &mut String, v: &Value) {
     }
 }
 
+/// A decimal in full up to 50 digits, else as head…tail<digits>.
+fn short_value(d: &str) -> String {
+    let len = d.chars().count();
+    if len <= 50 || !d.is_ascii() {
+        return d.to_string();
+    }
+    format!("{}…{}<{len}>", &d[..16], &d[d.len() - 6..])
+}
+
+/// A sequence id as a label: an id above 10^18 is a minted fid, meaningless to a reader, so the
+/// start VALUE the service sends with it (`value_key`, already including any exponent) is shown.
+fn seq_label(v: &Value, id_key: &str, exp_key: &str, value_key: &str) -> String {
+    let val = s(v, value_key);
+    if val.is_empty() || u(v, id_key) <= STARTDB {
+        seq_base_exp(v, id_key, exp_key)
+    } else {
+        short_value(val)
+    }
+}
+
+/// `end_str`, naming a merge target by its start value (`value`, sent next to the end) when its id
+/// is a minted fid.
+fn end_label(e: &Value, value: &str) -> String {
+    if s(e, "kind") == "merge" && u(e, "base") > STARTDB && !value.is_empty() {
+        format!("merges into {} at index {}", short_value(value), u(e, "at"))
+    } else {
+        end_str(e)
+    }
+}
+
 fn r_seq_status(o: &mut String, v: &Value, indent: usize) {
     let mut kv = Kv::new();
-    kv.add("base", seq_base_exp(v, "base", "base_exp"));
+    kv.add("base", seq_label(v, "base", "base_exp", "base_value"));
     kv.add("length", commas(u(v, "length")));
-    kv.add("end", end_str(v.get("end").unwrap_or(&Value::Null)));
+    kv.add("end", end_label(v.get("end").unwrap_or(&Value::Null), s(v, "end_merge_base")));
     kv.add("own length", commas(u(v, "own_length")));
-    kv.add("own end", end_str(v.get("own_end").unwrap_or(&Value::Null)));
+    kv.add("own end", end_label(v.get("own_end").unwrap_or(&Value::Null), s(v, "own_end_merge_base")));
     // `merges_in` counts OTHER sequences that join this one (not where this one goes - that is `end`).
     let joined_by = u(v, "merges_in");
     kv.add(
@@ -1209,7 +1243,7 @@ fn r_seq_status(o: &mut String, v: &Value, indent: usize) {
     kv.write(o, indent);
     let merges = arr(v, "merges");
     if !merges.is_empty() {
-        let rows: Vec<Vec<String>> = merges.iter().map(|m| vec![n(m, "at"), seq_base_exp(m, "base", "exp"), n(m, "into_at")]).collect();
+        let rows: Vec<Vec<String>> = merges.iter().map(|m| vec![n(m, "at"), seq_label(m, "base", "exp", "base_value"), n(m, "into_at")]).collect();
         let _ = writeln!(o, "{}merge crossings along the walk:", " ".repeat(indent));
         table(o, &["at index", "into sequence", "at its index"], &rows, indent);
     }
@@ -1234,6 +1268,15 @@ fn r_seq_view(o: &mut String, v: &Value) {
             seq_terms(o, terms, 0);
         }
         _ => o.push_str("\n(no terms)\n"),
+    }
+    // An open frontier comes with its "check for factors" plan (what `--check` would run).
+    if let Some(c) = v.get("check").filter(|c| !c.is_null()) {
+        o.push_str("\ncheck for factors (last term)\n");
+        if has(c, "error") {
+            let _ = writeln!(o, "  {}", s(c, "error"));
+        } else {
+            check_factors_kv(c).write(o, 2);
+        }
     }
 }
 
@@ -1420,6 +1463,17 @@ fn r_status(o: &mut String, v: &Value) {
             if !rows.is_empty() {
                 table(o, &["method", "count", "max digits"], &rows, 2);
             }
+        }
+        _ => o.push_str("  (unavailable)\n"),
+    }
+    o.push_str("\nproof and PRP-test queue\n");
+    match v.get("worker_queue") {
+        Some(q) if !q.is_null() => {
+            let mut kv = Kv::new();
+            kv.add("proofs", format!("{} running, {} waiting", commas(u(q, "proofs_running")), commas(u(q, "proofs_waiting"))));
+            kv.add("PRP tests", format!("{} running, {} waiting", commas(u(q, "prp_running")), commas(u(q, "prp_waiting"))));
+            kv.add("queue capacity", commas(u(q, "cap")));
+            kv.write(o, 2);
         }
         _ => o.push_str("  (unavailable)\n"),
     }

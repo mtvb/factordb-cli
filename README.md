@@ -182,3 +182,7 @@ Seen through the CLI against fdbtest; they live in `fdb-rpc` / `fdb-service`:
 `digit_distribution` returns `count + 1` rows; `download P 0` returns 19-digit primes;
 `report_factors` on a small literal accepts a non-dividing factor and a non-number factor yields
 `term: Empty`; `seq get 12` shows a `0` term past the end, and `seq extend 12` reports the base-1 leg.
+
+## Forks
+
+Forks of this project are very welcome.

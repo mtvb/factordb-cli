@@ -104,11 +104,17 @@ enum Cmd {
     Nextprime {
         #[arg(help = TARGET_HELP)]
         target: String,
+        /// Also print the prime's full decimal
+        #[arg(long)]
+        decimal: bool,
     },
     /// The previous prime below a number (max 3000 digits) [nearest_prime]
     Prevprime {
         #[arg(help = TARGET_HELP)]
         target: String,
+        /// Also print the prime's full decimal
+        #[arg(long)]
+        decimal: bool,
     },
     /// Numbers this one is a direct factor of; climb the divisor chain [factor_of]
     FactorOf {
@@ -318,6 +324,9 @@ enum Cmd {
         skip: u64,
         #[arg(long, default_value_t = 100)]
         limit: u64,
+        /// Also list the special-form finds (2^x-1, k*b^n+d, b^n+1, …) that P±1 finds easily
+        #[arg(long)]
+        show_special: bool,
     },
 
     // ---- Tools & downloads ----
@@ -526,6 +535,10 @@ enum SeqCmd {
         to: Option<u64>,
         #[arg(long = "type", visible_alias = "sequence", default_value = "aliquot", help = TYPE_HELP, value_name = "TYPE", value_parser = parse_seq_type)]
         kind: u8,
+        /// Also run the next "check for factors" step (P-1 / P+1 / ECM, up to 300 digits) on the
+        /// last term's composite, and show the sequence again when it found a factor [check_factors]
+        #[arg(long)]
+        check: bool,
     },
     /// Compute and store more terms [extend_sequence]
     Extend {
@@ -872,8 +885,8 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             ctx.simple("get_number", json!({ "target": target(&t)?, "decimal": decimal, "detail": detail }))
         }
         Cmd::Factors { target: t } => ctx.simple("get_factors", json!({ "target": target(&t)? })),
-        Cmd::Nextprime { target: t } => ctx.simple("nearest_prime", json!({ "target": target(&t)? })),
-        Cmd::Prevprime { target: t } => ctx.simple("nearest_prime", json!({ "target": target(&t)?, "below": true })),
+        Cmd::Nextprime { target: t, decimal } => ctx.simple("nearest_prime", json!({ "target": target(&t)?, "decimal": decimal })),
+        Cmd::Prevprime { target: t, decimal } => ctx.simple("nearest_prime", json!({ "target": target(&t)?, "below": true, "decimal": decimal })),
         Cmd::FactorOf { target: t, limit } => ctx.simple("factor_of", json!({ "target": target(&t)?, "limit": limit })),
         Cmd::Primality { target: t } => ctx.simple("primality", json!({ "target": target(&t)? })),
         Cmd::Algebraic { target: t } => ctx.simple("algebraic_factors", json!({ "target": target(&t)? })),
@@ -1018,9 +1031,9 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
                 Some(other) => Err(Error::Usage(format!("unknown --sort '{other}' (digits, best, nm1, np1, combined)"))),
             }
         }
-        Cmd::EcmList { type_id, min_digits, by_time, descending, skip, limit } => ctx.simple(
+        Cmd::EcmList { type_id, min_digits, by_time, descending, skip, limit, show_special } => ctx.simple(
             "ecm_list",
-            json!({ "type_id": type_id, "min_digits": min_digits, "by_time": by_time, "descending": descending, "skip": skip, "limit": limit }),
+            json!({ "type_id": type_id, "min_digits": min_digits, "by_time": by_time, "descending": descending, "skip": skip, "limit": limit, "include_special": show_special }),
         ),
 
         // ---- tools ----
@@ -1067,7 +1080,12 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
                 if ctx.json {
                     ctx.print("login", &v);
                 }
-                return Err(Error::Failed("login failed: unknown user name or wrong password".into()));
+                // after several failures the service makes the next attempt wait
+                let wait = match v.get("retry_after").and_then(Value::as_u64) {
+                    Some(w) if w > 0 => format!(" - too many failed attempts, try again in {w} s"),
+                    _ => String::new(),
+                };
+                return Err(Error::Failed(format!("login failed: unknown user name or wrong password{wait}")));
             }
             finish_session(&mut ctx, "login", &v, no_save, false)
         }
@@ -1372,13 +1390,35 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             let start = resolve_start(ctx, &start)?;
             ctx.simple("sequence_status", json!({ "start": start, "type": kind }))
         }
-        SeqCmd::View { start, part, fr, to, kind } => {
+        SeqCmd::View { start, part, fr, to, kind, check } => {
             let start = resolve_start(ctx, &start)?;
             let mut p = json!({ "start": start, "type": kind, "part": part, "fr": fr });
             if let Some(t) = to {
                 p["to"] = json!(t);
             }
-            ctx.simple_long("sequence_view", p)
+            let v = ctx.client.call_long("sequence_view", p.clone())?;
+            ctx.print("sequence_view", &v);
+            // The view carries the check plan of an open frontier (`check`): run its next step.
+            let plan = v.get("check").filter(|c| c.get("step").is_some() && c.get("fid").is_some());
+            if !check {
+                return Ok(());
+            }
+            let Some(plan) = plan else {
+                ctx.status("--check: nothing to run (the sequence is not open, or its composite has had every check)");
+                return Ok(());
+            };
+            let fid = plan.get("fid").and_then(|f| f.as_str().map(str::to_string).or_else(|| f.as_u64().map(|n| n.to_string()))).unwrap_or_default();
+            ctx.status(format!("\nchecking #{fid} for factors (up to 60 s) ..."));
+            let r = ctx.client.call_long("check_factors", json!({ "target": { "id": fid.parse::<u64>().unwrap_or(0) } }))?;
+            ctx.print("check_factors", &r);
+            if !r.get("factors").and_then(Value::as_array).is_some_and(|f| !f.is_empty()) {
+                return Ok(());
+            }
+            // a factor advances the sequence: show it again
+            ctx.status("\nthe sequence after the factor:");
+            let v = ctx.client.call_long("sequence_view", p)?;
+            ctx.print("sequence_view", &v);
+            Ok(())
         }
         SeqCmd::Extend { start, steps, kind } => {
             let start = resolve_start(ctx, &start)?;
