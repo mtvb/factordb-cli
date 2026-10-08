@@ -1002,7 +1002,17 @@ fn cert_stats_kv(v: &Value) -> Kv {
     kv.add("pending", commas(u(v, "pending")));
     kv.add("processing", commas(u(v, "processing")));
     for p in arr(v, "running") {
-        kv.add(&format!("verifying #{}", s(p, "fid")), cert_progress_text(p, 0));
+        // the number by its term or leading/trailing digits (sent along with the progress), else its id
+        let name = if s(p, "term").is_empty() && s(p, "preview").is_empty() {
+            format!("#{}", s(p, "fid"))
+        } else {
+            let label = serde_json::json!({
+                "term": p["term"].clone(), "preview": p["preview"].clone(), "tail": p["tail"].clone(),
+                "digits": p["number_digits"].clone(),
+            });
+            format!("{} (#{})", truncate(&number_text(&label), 60).trim_end(), s(p, "fid"))
+        };
+        kv.add(&format!("verifying {name}"), cert_progress_text(p, 0));
     }
     kv
 }
