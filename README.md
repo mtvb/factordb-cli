@@ -184,15 +184,6 @@ commands print objects.
 
 `fdb` dies quietly on a closed pipe (`fdb seq get 276 | head`), like other Unix filters.
 
-## Known server-side quirks (not CLI bugs)
-
-Seen through the CLI against fdbtest; they live in `fdb-rpc` / `fdb-service`:
-`download P 0` returns 19-digit primes (values up to 10^18 are never stored); `report_factors` on
-a small literal ignores the factors - a non-dividing or non-number one is accepted - and answers
-with the base of a perfect power (`report 1000 7` replies `10`); on a larger number a non-number
-factor yields `term: Empty`; `seq get 12` shows a `0` term past the end, and `seq extend 12`
-reports the base-1 leg.
-
 ## Forks
 
 Forks of this project are very welcome.
