@@ -16,9 +16,9 @@ Settings resolve as flag > environment > config file > default:
 
 | setting  | flag        | environment   | default                                   |
 |----------|-------------|---------------|-------------------------------------------|
-| endpoint | `--url`     | `FDB_RPC_URL` | `http://factordb.com/rpc`                 |
+| endpoint | `--url`     | `FDB_RPC_URL` | `https://factordb.com/rpc:4059`           |
 | token    | `--token`   | `FDB_TOKEN`   | none (anonymous); `''` forces anonymous   |
-| timeout  | `--timeout` |                | reads 120 s, writes unlimited (see below) |
+| timeout  | `--timeout` |               | reads 120 s, writes unlimited (see below) |
 
 The config file is `$FDB_CONFIG`, else `$XDG_CONFIG_HOME/fdb/config.toml`, else
 `~/.config/fdb/config.toml`. `fdb login <user>` writes the account's API token there (written
@@ -38,15 +38,17 @@ carried that same token); otherwise the new token is printed and the file is lef
 always prints instead of saving. `logout` invalidates the token and removes it from the file.
 
 **Timeouts.** `--timeout SECS` applies to every call (0 = none). Without it, read calls give up
-after 120 s while write calls (`report`, `prove`, `prp-test`, `proof-progress`, `seq extend`,
-`seq view`, `cert upload`, `id --create`, `call`) wait for the server, which finishes the work
-either way. A saved `timeout` in the config file is validated: only finite values from 0 up.
+after 120 s while write calls (`report`, `report-file`, `prove`, `check-factors`, `prp-test`,
+`proof-progress`, `seq extend`, `seq view`, `seq advance`, `cert upload`, `id --create`, `call`,
+`batch`) wait for the server, which finishes the work either way. A saved `timeout` in the config
+file is validated: only finite values from 0 up.
 
 ## Addressing numbers
 
 A `<TARGET>` is an expression - `2^127-1`, `150!`, `10^80+7`, `12345`, or a stored id written
 `id:1100000000024481675` (also `fid:N`; `#N` works too but must be quoted in a shell).
-Expressions accept `+ - * / ^ %`, `!`, `#`/`##` (primorial), `I(n)`/`lucas(n)` and parentheses.
+For the full expression syntax - operators, shortcuts and named functions - see
+https://factordb.com/syntax.php.
 
 Values up to 10^18 are literal ids: they are never stored, so `fdb id 12345 --create` reports
 `12345 (literal)` with `created no`. Larger values get a `#fid`; `created no` on one of those means
@@ -71,29 +73,34 @@ prime, one copy of the least prime dropped) and `mdc<b>` (mid-divisor concatenat
 | command | RPC method | notes |
 |---|---|---|
 | `id <EXPR> [--create]` | get_id | `--create` stores the number (write); values <= 10^18 are literals and never stored |
-| `number <TARGET> [--decimal] [--detail 0..2 \| --full]` | get_number | aliases `get`, `show`; default detail 1 (with factors); detail 2 adds primality, algebraic form and, for a composite in the scanner queue, its trial-division / ECM effort |
+| `number <TARGET> [--decimal] [--detail 0..2 \| --full]` | get_number | aliases `get`, `show`; default detail 1 (with factors); detail 2 adds primality, algebraic form, sequence membership and, for a composite in the scanner queue, its trial-division / ECM effort |
 | `factors <TARGET>` | get_factors | |
+| `factor-of <TARGET> [--limit N]` | factor_of | the numbers this one is a direct factor of (climbs the divisor chain); `--limit` at most 200 |
+| `nextprime <TARGET> [--decimal]` | nearest_prime | the next prime above; view-only (not stored); inputs up to 1000 digits |
+| `prevprime <TARGET> [--decimal]` | nearest_prime | the previous prime below; view-only (not stored); inputs up to 1000 digits |
 | `primality <TARGET>` | primality | while a certificate is being verified, prints its progress (steps done, elapsed, a digit-weighted work estimate) |
 | `algebraic <TARGET>` | algebraic_factors | |
-| `family <EXPR> [--start N] [--limit N]` | get_family | `x` is the variable, e.g. `2^x-1` |
+| `family <EXPR> [--start N] [--limit N] [--factors]` | get_family | one lowercase letter is the variable, e.g. `2^x-1` or `10^n+1`; `--factors` adds each member's factorization |
 | `report <TARGET> [FACTOR] [--file F] [--credit]` | report_factors | write; `--file -` reads stdin; `--credit` records the factors as your contributions (token required; a factor counts when it is new for an existing number and both it and its cofactor have at least 30 digits) |
 | `report-file <FILE> [--batch N] [--from-line L] [--dry-run] [--credit]` | report_factors | write; bulk submit, one `NUMBER=FACTOR` per line (`NUMBER` an expression or an id written `#N`; `-` reads stdin); sent as JSON-RPC batches of `--batch` numbers per request (default 100); a `#` not followed by a digit starts a comment; malformed lines are skipped with a warning; `--from-line` resumes a stopped run |
 | `prove <TARGET>` | prove | write; large numbers queue |
 | `proof-progress <TARGET>` | proof_progress | write (may create the N±1 ids) |
-| `proof-state <TARGET> [--wait]` | proof_state | `--wait` polls until dequeued |
+| `proof-state <TARGET> [--wait [--interval S]]` | proof_state | `--wait` polls until dequeued, every `--interval` seconds (default 5) |
 | `proof-list [--type 0..3] [--min-digits] [--descending] [--skip] [--limit]` | proof_list | |
+| `check-factors <TARGET> [--dry-run]` | check_factors | write; runs the next bounded P-1 / P+1 / ECM step on a stored composite of at most 300 digits and reports a factor it finds; `--dry-run` only shows the level and the next step |
+| `snfs <TARGET> [--format list\|ggnfs\|msieve\|cado] [--poly I] [-o FILE]` | snfs_poly | SNFS polynomials for a special-form composite: the list, best first, or polynomial `--poly` as a GGNFS / yafu job file, msieve `.fb` or CADO-NFS `.poly` with sieving parameters |
 | `prp-test <TARGET>` | prp_test | write |
 | `prp-test-info <TARGET>` | prp_test_info | |
 | `cert get <TARGET> [-o FILE]` | get_certificate | the stored bytes, exactly, to stdout (metadata on stderr) or to FILE |
 | `cert upload <FILE>` | upload_certificate | write; `-` = stdin (once); see below |
 | `cert list [--min-digits] [--pending] [--descending] [--skip] [--limit] [--user UID] [--software ID]` | cert_list | smallest first; `--descending` for largest first; a certificate under verification shows `processing done/total`; `--user 0` = anonymous uploads |
-| `cert chain <TARGET> [--skip N] [--limit N]` | cert_chain | the whole chain by default; `--skip`/`--limit` page it (a paged reply says `steps a-b of total`) |
+| `cert chain <TARGET> [--skip N] [--limit N] [--sizes]` | cert_chain | the whole chain by default; `--skip`/`--limit` page it (a paged reply says `steps a-b of total`); `--sizes` gives only each step's digit size, fast for any chain length |
 | `cert stats` | cert_stats | totals, plus one `verifying #id` line per verification in flight |
 | `cert top [--by user\|software] [--sort score\|n\|size]` | cert_top / cert_software_top | the certificate leaderboards: top 100 uploaders, or the programs and their top 100 versions; score = sum of (digits/1000)^4 over verified certificates |
 | `seq get <START> [--from N] [--type T]` | get_sequence | elf-style `index . value = factors`; `--type` = family name or code |
 | `seq sizes <START> [--type T]` | sequence_sizes | |
 | `seq status <START> [--type T]` | sequence_status | |
-| `seq view <START> [--part all\|last\|last20\|range] [--fr N] [--type T]` | sequence_view | write (advances the frontier first) |
+| `seq view <START> [--part all\|last\|last20\|range] [--fr N] [--to N] [--type T] [--check]` | sequence_view | write (advances the frontier first); `--to` ends a `range` (inclusive); `--check` also runs the next check-factors step on the last term's composite and shows the sequence again when it found a factor |
 | `seq extend <START> [--steps N] [--type T]` | extend_sequence | write |
 | `seq advance <START> [--type T] [--threads N] [--from L] [--to L] [--terms N] [--max-digits D] [--ecm PATH] [--heartbeat S] [--no-submit] [--credit]` | sequence_view + report_factors | alias `work`; factors the open frontier locally with gmp-ecm over the t20..t65 ladder and reports each factor (write); `--credit` as in `report` |
 | `seq list [--limit] [--offset] [--type] [--category] [--end KIND] [--sort] [--dir] [--driver CODE] [--guide V]` | list_sequences | `--guide` filters on the frontier's exact guide value (finer than `--driver`) |
@@ -106,9 +113,10 @@ prime, one copy of the least prime dropped) and `mdc<b>` (mid-divisor concatenat
 | `digit-distribution [--start] [--count]` | digit_distribution | stored numbers begin at 19 digits |
 | `factor-tables` | factor_tables | |
 | `list <TABLE> [--min-digits] [--offset] [--limit]` | list_by_type | P, PRP, C, U, CF |
-| `ecm-list [--type 0..4] [--min-digits] [--by-time] [--descending] [--skip] [--limit]` | ecm_list | |
+| `ecm-list [--type 0..4] [--min-digits] [--by-time] [--descending] [--skip] [--limit] [--show-special]` | ecm_list | `--show-special` also lists the special-form finds (2^x-1, k*b^n+d, b^n+1, ...) |
 | `ecm-group-order <PRIME> --sigma S [--param 0-3]` | ecm_group_order | alias `group-order`; `--param` (alias `--curve`) picks the GMP-ECM parametrization, see below |
-| `download <TABLE> <DIGITS> [--count 1..50000] [--random] [-o FILE]` | download | one number per line; nothing at all when empty |
+| `download <TABLE> <DIGITS> [--count 1..50000] [--random] [--terms] [-o FILE]` | download | one number per line; nothing at all when empty; `--terms` writes each number as its full stored term (a cofactor as `(parent)/factors`) instead of the export format |
+| `primo-batch <DIGITS> [--count 1..32000] [-o DIR [--parts N]]` | primo_batch | probable primes without a certificate, smallest first: listed, or with `-o` one Primo input file `primo_<id>.in` each; `--parts` spreads the files round-robin over subdirectories 1..N |
 | `login <USER> [-p PASS] [--no-save]` | login | prompts for the password (or reads stdin when piped); saves the token |
 | `register <USER> [--name N] [-p PASS] [--no-save]` | register | |
 | `whoami [--session TOKEN]` | whoami | |
@@ -179,9 +187,11 @@ commands print objects.
 ## Known server-side quirks (not CLI bugs)
 
 Seen through the CLI against fdbtest; they live in `fdb-rpc` / `fdb-service`:
-`digit_distribution` returns `count + 1` rows; `download P 0` returns 19-digit primes;
-`report_factors` on a small literal accepts a non-dividing factor and a non-number factor yields
-`term: Empty`; `seq get 12` shows a `0` term past the end, and `seq extend 12` reports the base-1 leg.
+`download P 0` returns 19-digit primes (values up to 10^18 are never stored); `report_factors` on
+a small literal ignores the factors - a non-dividing or non-number one is accepted - and answers
+with the base of a perfect power (`report 1000 7` replies `10`); on a larger number a non-number
+factor yields `term: Empty`; `seq get 12` shows a `0` term past the end, and `seq extend 12`
+reports the base-1 leg.
 
 ## Forks
 

@@ -17,7 +17,7 @@ use config::Config;
 
 const TARGET_HELP: &str = "A number: an expression (2^127-1, 150!+1, 10^80+7, 12345) or a stored id written id:N";
 const TYPE_HELP: &str = "Which sequence family: a name or code aliquot (1), hp10 = home prime base 10, ihp3 = inverse home \
-prime base 3, lpf2+1 = largest prime factor²+1,(see `fdb seq types`)";
+prime base 3, lpf2+1 = largest prime factor²+1 (see `fdb seq types`)";
 const START_HELP: &str = "Starting number (a value up to 10^18, an expression evaluating to one, or a stored id as id:N)";
 const PASSWORD_HELP: &str =
     "Password. Prompted when omitted (or read from stdin when piped); avoid -p, which exposes it to `ps` and shell history";
@@ -26,15 +26,16 @@ const LONG_ABOUT: &str = "\
 Command-line client for the factordb JSON-RPC API.
 
 Numbers can be addressed by expression (2^131-1, 10^80+7, 150!+1, 12345) or by stored id (id:123456).
-Expressions accept + - * / ^ %, ! (factorial), # / ## (primorial), I(n) / lucas(n) and parentheses.
+For the full expression syntax (operators, shortcuts and named functions) see https://factordb.com/syntax.php.
 
 Settings resolve in this order: flag > environment > config file > default.
-  endpoint  --url      FDB_RPC_URL   (default http://127.0.0.1:4059/rpc)
+  endpoint  --url      FDB_RPC_URL   (default https://factordb.com:4059/rpc)
   token     --token    FDB_TOKEN     (set by `fdb login`; sent as X-Fdb-User-Token; '' = anonymous)
   config    $FDB_CONFIG or ~/.config/fdb/config.toml
 
-Without --timeout, reads give up after 120 s; writes (report, prove, prp-test, seq extend/view,
-cert upload) wait for the server, which finishes the work either way.
+Without --timeout, reads give up after 120 s; writes (report, report-file, prove, check-factors,
+proof-progress, prp-test, seq view/extend/advance, cert upload, id --create, call, batch) wait for
+the server, which finishes the work either way.
 
 Exit codes: 0 ok · 1 the call failed (RPC error, rejected login, nothing found) · 2 usage ·
 3 service unreachable / HTTP error · 4 rate limit or quota exhausted · 5 address blocked.";
@@ -69,6 +70,15 @@ fn parse_timeout(s: &str) -> std::result::Result<f64, String> {
     config::check_timeout(t)
 }
 
+/// `--max-pct`: a percentage 0..=100 (up to two decimals count), as the hundredths the RPC takes.
+fn parse_pct(s: &str) -> std::result::Result<u16, String> {
+    let p: f64 = s.trim().trim_end_matches('%').parse().map_err(|_| format!("'{s}' is not a percentage"))?;
+    if !(0.0..=100.0).contains(&p) {
+        return Err(format!("'{s}' is not between 0 and 100"));
+    }
+    Ok((p * 100.0).round() as u16)
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     // ---- Numbers & factors ----
@@ -88,7 +98,8 @@ enum Cmd {
         /// Include the full decimal value (when not too large to inline)
         #[arg(long)]
         decimal: bool,
-        /// 0 = basic; 1 = also factors; 2 = also primality, algebraic form and sequence membership
+        /// 0 = basic; 1 = also factors; 2 = also primality, algebraic form, sequence membership and,
+        /// for a composite in the scanner queue, its trial-division / ECM effort
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=2), conflicts_with = "full")]
         detail: u8,
         /// Everything (same as --detail 2)
@@ -100,7 +111,7 @@ enum Cmd {
         #[arg(help = TARGET_HELP)]
         target: String,
     },
-    /// The next prime above a number (view-only, not stored; max 3000 digits) [nearest_prime]
+    /// The next prime above a number (view-only, not stored; max 1000 digits) [nearest_prime]
     Nextprime {
         #[arg(help = TARGET_HELP)]
         target: String,
@@ -108,7 +119,7 @@ enum Cmd {
         #[arg(long)]
         decimal: bool,
     },
-    /// The previous prime below a number (max 3000 digits) [nearest_prime]
+    /// The previous prime below a number (max 1000 digits) [nearest_prime]
     Prevprime {
         #[arg(help = TARGET_HELP)]
         target: String,
@@ -120,7 +131,7 @@ enum Cmd {
     FactorOf {
         #[arg(help = TARGET_HELP)]
         target: String,
-        /// Max parents to list
+        /// Max parents to list (at most 200)
         #[arg(long, default_value_t = 20)]
         limit: u64,
     },
@@ -136,12 +147,12 @@ enum Cmd {
     },
     /// Neighbouring members of a family such as 2^x-1 around an index [get_family]
     Family {
-        /// Family expression with x as the variable, e.g. 2^x-1
+        /// Family expression with one lowercase letter as the variable, e.g. 2^x-1 or 10^n+1
         expr: String,
         /// First index (may be negative)
         #[arg(long, default_value_t = 1, allow_negative_numbers = true)]
         start: i64,
-        /// How many members to list
+        /// How many members to list (at most 1000)
         #[arg(long, default_value_t = 20)]
         limit: u32,
         /// Also show each member's factorization
@@ -296,17 +307,21 @@ enum Cmd {
         /// Maximum 1000
         #[arg(long, default_value_t = 100)]
         limit: u64,
-        /// PRP only: order by how far N-1 / N+1 are factored, most factored first - best (the
-        /// better side), nm1, np1 or combined - instead of smallest first [prp_candidates]
+        /// digits (default): smallest first. PRP only: order by how far N-1 / N+1 are factored, most
+        /// factored first - best (the better side), nm1, np1 or combined [prp_candidates]
         #[arg(long, value_name = "ORDER")]
         sort: Option<String>,
-        /// With --sort: only numbers of at most this many digits (0 = no bound)
+        /// Only numbers of at most this many digits (0 = no bound)
         #[arg(long, default_value_t = 0)]
         max_digits: u64,
         /// With --sort: include the numbers a proof is possible for already (N-1 or N+1 past one
         /// third, or the combined test; `fdb prove` proves those)
         #[arg(long)]
         all: bool,
+        /// With --sort: only numbers factored at most PCT percent on the sorted side (e.g. 33.33 =
+        /// still short of the one third a proof needs)
+        #[arg(long, value_name = "PCT", value_parser = parse_pct)]
+        max_pct: Option<u16>,
     },
     /// Factors found by ECM / P-1 / P+1 [ecm_list]
     EcmList {
@@ -322,6 +337,7 @@ enum Cmd {
         descending: bool,
         #[arg(long, default_value_t = 0)]
         skip: u64,
+        /// Maximum 1000
         #[arg(long, default_value_t = 100)]
         limit: u64,
         /// Also list the special-form finds (2^x-1, k*b^n+d, b^n+1, …) that P±1 finds easily
@@ -347,7 +363,7 @@ enum Cmd {
     Download {
         /// C, CF, PRP, U or P
         table: String,
-        /// Exact decimal digit count
+        /// Smallest decimal digit count - larger sizes follow when needed (exactly this size with --random)
         digits: u64,
         /// How many (1 to 50000)
         #[arg(long, default_value_t = 1000)]
@@ -361,6 +377,20 @@ enum Cmd {
         /// Write the numbers to FILE instead of stdout
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
+    },
+    /// Primo input files for probable primes that have no certificate yet, smallest first [primo_batch]
+    PrimoBatch {
+        /// Smallest decimal digit count
+        digits: u64,
+        /// How many (1 to 32000)
+        #[arg(long, default_value_t = 10)]
+        count: u64,
+        /// Write one Primo input file per number (primo_<id>.in) into DIR instead of listing them
+        #[arg(short, long, value_name = "DIR")]
+        output: Option<PathBuf>,
+        /// With --output: spread the files round-robin over subdirectories 1..N, one per Primo instance (1 to 32)
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        parts: u64,
     },
 
     // ---- Account ----
@@ -407,6 +437,7 @@ enum Cmd {
     Contributions {
         #[arg(long, default_value_t = 0)]
         skip: u64,
+        /// Maximum 1000
         #[arg(long, default_value_t = 100)]
         limit: u64,
     },
@@ -462,6 +493,7 @@ enum CertCmd {
         descending: bool,
         #[arg(long, default_value_t = 0)]
         skip: u64,
+        /// Maximum 1000
         #[arg(long, default_value_t = 100)]
         limit: u64,
         /// Only certificates uploaded by this account (uid; 0 = anonymous)
@@ -480,6 +512,9 @@ enum CertCmd {
         /// 0 = the whole chain
         #[arg(long, default_value_t = 0)]
         limit: u64,
+        /// Only the step and digit size of each prime - fast for any chain length
+        #[arg(long)]
+        sizes: bool,
     },
     /// Certificate leaderboards: by uploader, or by software and version [cert_top / cert_software_top]
     Top {
@@ -552,13 +587,15 @@ enum SeqCmd {
     },
     /// Browse known sequences [list_sequences]
     List {
+        /// Maximum 500
         #[arg(long, default_value_t = 50)]
         limit: u32,
         #[arg(long, default_value_t = 0)]
         offset: u32,
         #[arg(long = "type", visible_alias = "sequence", default_value = "aliquot", help = TYPE_HELP, value_name = "TYPE", value_parser = parse_seq_type)]
         kind: u8,
-        /// Start-value magnitude category (0 = up to 1000, 1 = up to 10000)
+        /// Start-value magnitude category: n = starts up to 10^(n+3), above the previous one
+        /// (0 = up to 1000, 1 = 1001 to 10000, 2 = 10001 to 100000, ...)
         #[arg(long, default_value_t = 0)]
         category: u8,
         /// Only sequences ending this way
@@ -1013,9 +1050,12 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
         Cmd::CombProgress => ctx.simple("comb_progress", json!({})),
         Cmd::DigitDistribution { start, count } => ctx.simple("digit_distribution", json!({ "start": start, "count": count })),
         Cmd::FactorTables => ctx.simple("factor_tables", json!({})),
-        Cmd::List { table, min_digits, offset, limit, sort, max_digits, all } => {
+        Cmd::List { table, min_digits, offset, limit, sort, max_digits, all, max_pct } => {
             let table = table_name(&table, &["P", "PRP", "C", "U", "CF"])?;
             match sort.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                None | Some("digits") if max_pct.is_some() => {
+                    Err(Error::Usage("--max-pct needs --sort best, nm1, np1 or combined (PRP only)".into()))
+                }
                 None | Some("digits") => {
                     let mut params = json!({ "table": table, "min_digits": min_digits, "offset": offset, "limit": limit });
                     if max_digits > 0 {
@@ -1023,10 +1063,14 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
                     }
                     ctx.simple("list_by_type", params)
                 }
-                Some(order @ ("best" | "nm1" | "np1" | "combined")) if table == "PRP" => ctx.simple(
-                    "prp_candidates",
-                    json!({ "sort": order, "min_digits": min_digits, "max_digits": max_digits, "open": !all, "offset": offset, "limit": limit }),
-                ),
+                Some(order @ ("best" | "nm1" | "np1" | "combined")) if table == "PRP" => {
+                    let mut params =
+                        json!({ "sort": order, "min_digits": min_digits, "max_digits": max_digits, "open": !all, "offset": offset, "limit": limit });
+                    if let Some(m) = max_pct {
+                        params["max"] = json!(m);   // hundredths of a percent
+                    }
+                    ctx.simple("prp_candidates", params)
+                }
                 Some("best" | "nm1" | "np1" | "combined") => Err(Error::Usage("--sort by N-1 / N+1 factorization is for the PRP table".into())),
                 Some(other) => Err(Error::Usage(format!("unknown --sort '{other}' (digits, best, nm1, np1, combined)"))),
             }
@@ -1066,6 +1110,37 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
                 }
                 None => ctx.print("download", &v),
             }
+            Ok(())
+        }
+
+        Cmd::PrimoBatch { digits, count, output, parts } => {
+            if count == 0 || count > 32_000 {
+                return Err(Error::Usage(format!("--count must be between 1 and 32000, got {count}")));
+            }
+            if parts == 0 || parts > 32 {
+                return Err(Error::Usage(format!("--parts must be between 1 and 32, got {parts}")));
+            }
+            let v = ctx.client.call("primo_batch", json!({ "digits": digits, "count": count }))?;
+            let Some(dir) = output else {
+                ctx.print("primo_batch", &v);
+                return Ok(());
+            };
+            let numbers = v.get("numbers").and_then(Value::as_array).cloned().unwrap_or_default();
+            let parts = parts.min(numbers.len().max(1) as u64);
+            for (k, n) in numbers.iter().enumerate() {
+                let fid = n.get("fid").map(|x| x.to_string().trim_matches('"').to_string()).unwrap_or_default();
+                let sub = if parts > 1 { dir.join(((k as u64 % parts) + 1).to_string()) } else { dir.clone() };
+                std::fs::create_dir_all(&sub)?;
+                let text = primo_input(
+                    &fid,
+                    n.get("digits").and_then(Value::as_u64).unwrap_or(0),
+                    n.get("term").and_then(Value::as_str).unwrap_or(""),
+                    n.get("hex").and_then(Value::as_str).unwrap_or(""),
+                );
+                std::fs::write(sub.join(format!("primo_{fid}.in")), text)?;
+            }
+            let into = if parts > 1 { format!("{} (subdirectories 1..{parts})", dir.display()) } else { dir.display().to_string() };
+            ctx.status(format!("{} Primo input file(s) written to {into}", numbers.len()));
             Ok(())
         }
 
@@ -1272,8 +1347,12 @@ fn run_cert(ctx: &Ctx, c: CertCmd) -> Result<()> {
             }
             ctx.simple("cert_list", p)
         }
-        CertCmd::Chain { target: t, skip, limit } => {
-            ctx.simple("cert_chain", json!({ "target": target(&t)?, "skip": skip, "limit": limit }))
+        CertCmd::Chain { target: t, skip, limit, sizes } => {
+            let mut p = json!({ "target": target(&t)?, "skip": skip, "limit": limit });
+            if sizes {
+                p["sizes"] = json!(true);
+            }
+            ctx.simple("cert_chain", p)
         }
         CertCmd::Top { by, sort } => {
             ctx.simple(if by == "software" { "cert_software_top" } else { "cert_top" }, json!({ "sort": sort }))
@@ -1681,6 +1760,14 @@ struct BulkReport {
 /// Most factors merged into one report; a longer run of lines for one number starts another.
 const BULK_MAX_FACTORS: usize = 200;
 
+fn primo_input(fid: &str, digits: u64, term: &str, hex: &str) -> String {
+    let short = if term.is_empty() { String::new() } else { format!(";Short form is {term}\n") };
+    format!(
+        ";This is an input file for PRIMO\n;Number expressed to the base 16\n\
+         ;The database-id of this number is {fid}, it has {digits} digits.\n{short}\n[Candidate]\nN$={hex}\n"
+    )
+}
+
 /// Parse a bulk factor file: one `NUMBER=FACTOR` per line, NUMBER an expression or a stored id
 /// (`#N`, `id:N`, `fid:N`), FACTOR a decimal or an expression. Blank lines are skipped, and so are
 /// comment lines - a `#` that is not followed by a digit (`#123=...` is an id line). Lines before
@@ -1973,7 +2060,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     ("Certificates", &["cert"]),
     ("Sequences", &["seq"]),
     ("Statistics & listings", &["status", "stats", "smallest", "comb-progress", "digit-distribution", "factor-tables", "list", "ecm-list"]),
-    ("Tools & downloads", &["ecm-group-order", "download"]),
+    ("Tools & downloads", &["ecm-group-order", "download", "primo-batch"]),
     ("Account", &["login", "register", "whoami", "regenerate-token", "logout", "quota", "contributions"]),
     ("Utility", &["health", "call", "batch", "config"]),
 ];
@@ -2161,8 +2248,30 @@ fn wrap_first(o: &mut String, first: &str, text: &str, indent: usize, width: usi
 mod tests {
     use super::*;
 
+    #[test]
+    fn max_pct_is_hundredths() {
+        assert_eq!(parse_pct("33.33"), Ok(3333));
+        assert_eq!(parse_pct("50%"), Ok(5000));
+        assert_eq!(parse_pct("0"), Ok(0));
+        assert_eq!(parse_pct("100"), Ok(10000));
+        assert!(parse_pct("100.5").is_err());
+        assert!(parse_pct("-1").is_err());
+        assert!(parse_pct("NaN").is_err());
+        assert!(parse_pct("x").is_err());
+    }
+
     /// The bulk factor file: ids and expressions, comments vs. `#id` lines, merging of consecutive
     /// lines for one number, --from-line, and malformed lines being skipped (the rest still parses).
+    #[test]
+    fn primo_input_matches_the_site() {
+        assert_eq!(
+            primo_input("1100000009243614530", 301, "", "c739"),
+            ";This is an input file for PRIMO\n;Number expressed to the base 16\n\
+             ;The database-id of this number is 1100000009243614530, it has 301 digits.\n\n[Candidate]\nN$=c739\n"
+        );
+        assert!(primo_input("7", 301, "10^300+16567", "ab").contains(";Short form is 10^300+16567\n\n[Candidate]\n"));
+    }
+
     #[test]
     fn report_file_parses_numbers_ids_and_comments() {
         let text = "# a comment\n\n2^67-1=193707721\n2^67-1 = 761838257287\n#1100000000000000123=1009\n  id:77=3\n10^20+1=73\n2^67-1=193707721\n";

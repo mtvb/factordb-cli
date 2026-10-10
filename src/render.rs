@@ -53,6 +53,7 @@ pub fn render(method: &str, v: &Value) -> String {
         "ecm_list" => r_ecm_list(&mut o, v),
         "ecm_group_order" => r_group_order(&mut o, v),
         "download" => r_download(&mut o, v),
+        "primo_batch" => r_primo_batch(&mut o, v),
         "login" | "register" | "regenerate_token" => r_session(&mut o, v),
         "whoami" => r_whoami(&mut o, v),
         "logout" => o.push_str("logged out\n"),
@@ -981,18 +982,25 @@ fn r_cert_chain(o: &mut String, v: &Value) {
     } else {
         let _ = writeln!(o, "certificate chain of #{}", u(v, "fid"));
     }
-    let rows: Vec<Vec<String>> = arr(v, "chain")
+    let chain = arr(v, "chain");
+    if chain.is_empty() {
+        o.push_str("(empty chain)\n");
+        return;
+    }
+    // `--sizes` replies carry only step + digits
+    if chain.iter().all(|c| c.get("tofid").is_none()) {
+        let rows: Vec<Vec<String>> = chain.iter().map(|c| vec![n(c, "step"), commas(u(c, "digits"))]).collect();
+        table(o, &["step", "digits"], &rows, 0);
+        return;
+    }
+    let rows: Vec<Vec<String>> = chain
         .iter()
         .map(|c| {
             let text = if s(c, "term").is_empty() { truncate(s(c, "preview"), 40) } else { truncate(s(c, "term"), 40) };
             vec![n(c, "step"), fid_label(c, "tofid"), commas(u(c, "digits")), n(c, "type"), text]
         })
         .collect();
-    if rows.is_empty() {
-        o.push_str("(empty chain)\n");
-    } else {
-        table(o, &["step", "id", "digits", "type", "number"], &rows, 0);
-    }
+    table(o, &["step", "id", "digits", "type", "number"], &rows, 0);
 }
 
 fn cert_stats_kv(v: &Value) -> Kv {
@@ -1653,6 +1661,19 @@ fn r_group_order(o: &mut String, v: &Value) {
 fn r_download(o: &mut String, v: &Value) {
     for x in arr(v, "numbers") {
         let _ = writeln!(o, "{}", x.as_str().unwrap_or(""));
+    }
+}
+
+/// The Primo batch as a list: id, size and short formula of each probable prime.
+fn r_primo_batch(o: &mut String, v: &Value) {
+    let rows: Vec<Vec<String>> = arr(v, "numbers")
+        .iter()
+        .map(|n| vec![fid_label(n, "fid"), commas(u(n, "digits")), s(n, "term").to_string()])
+        .collect();
+    if rows.is_empty() {
+        o.push_str("no probable prime without a certificate from that size up\n");
+    } else {
+        table(o, &["id", "digits", "term"], &rows, 0);
     }
 }
 
