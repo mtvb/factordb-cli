@@ -927,7 +927,16 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
         Cmd::FactorOf { target: t, limit } => ctx.simple("factor_of", json!({ "target": target(&t)?, "limit": limit })),
         Cmd::Primality { target: t } => ctx.simple("primality", json!({ "target": target(&t)? })),
         Cmd::Algebraic { target: t } => ctx.simple("algebraic_factors", json!({ "target": target(&t)? })),
-        Cmd::Family { expr, start, limit, factors } => ctx.simple("get_family", json!({ "expr": expr, "start": start, "limit": limit, "factors": factors })),
+        Cmd::Family { expr, start, limit, factors } => {
+            // rendered with the expression, for each member's term; --json prints the reply as it is
+            let v = ctx.client.call("get_family", json!({ "expr": expr, "start": start, "limit": limit, "factors": factors }))?;
+            if ctx.json {
+                ctx.print_json(&v);
+            } else {
+                print!("{}", render::render_family(&expr, &v));
+            }
+            Ok(())
+        }
         Cmd::Report { target: t, factors, file, credit } => {
             let mut list = factors;
             if let Some(f) = file {

@@ -18,7 +18,7 @@ pub fn render(method: &str, v: &Value) -> String {
         "factor_of" => r_factor_of(&mut o, v),
         "primality" => primality_kv(v).write(&mut o, 0),
         "algebraic_factors" => r_algebraic(&mut o, v, 0),
-        "get_family" => r_family(&mut o, v),
+        "get_family" => r_family(&mut o, v, None),
         "report_factors" => r_report(&mut o, v),
         "check_factors" => r_check_factors(&mut o, v),
         "snfs_poly" => crate::snfs::list(&mut o, v),
@@ -670,20 +670,38 @@ fn r_algebraic(o: &mut String, v: &Value, indent: usize) {
     }
 }
 
-fn r_family(o: &mut String, v: &Value) {
+pub fn render_family(expr: &str, v: &Value) -> String {
+    let mut o = String::new();
+    r_family(&mut o, v, Some(expr));
+    o
+}
+
+fn r_family(o: &mut String, v: &Value, expr: Option<&str>) {
     // With --factors the server folds each member's factorization in: one more column, the
     // factors as base^exp with a status tag on anything but a proven prime (like `seq get`).
     let with_factors = arr(v, "members").iter().any(|m| has(m, "factors"));
+    let var = expr.and_then(family_variable);
     let rows: Vec<Vec<String>> = arr(v, "members")
         .iter()
         .map(|m| {
             let x = n(m, "x");
+            let xi = m.get("x").and_then(Value::as_i64).unwrap_or(0);
+            let term = match (expr, var) {
+                (Some(e), Some(c)) => family_member_term(e, c, xi),
+                _ => String::new(),
+            };
             let mut row = match m.get("member") {
                 Some(mem) if !mem.is_null() => {
                     let id = mem.get("id").cloned().unwrap_or(Value::Null);
-                    vec![x, id_label(&id), s(mem, "status").to_string(), commas(u(mem, "digits"))]
+                    let number = if s(m, "preview").is_empty() {
+                        id_label(&id)
+                    } else {
+                        number_text(&serde_json::json!({ "preview": s(m, "preview"), "tail": s(m, "tail"), "digits": u(mem, "digits") }))
+                    };
+                    let term = if term.is_empty() { id_label(&id) } else { term };
+                    vec![x, term, number, s(mem, "status").to_string()]
                 }
-                _ => vec![x, "-".into(), "-".into(), "-".into()],
+                _ => vec![x, if term.is_empty() { "-".into() } else { term }, "-".into(), "-".into()],
             };
             if with_factors {
                 let fs: Vec<String> = arr(m, "factors").iter().map(factor_str).collect();
@@ -695,10 +713,72 @@ fn r_family(o: &mut String, v: &Value) {
     if rows.is_empty() {
         o.push_str("(no members)\n");
     } else if with_factors {
-        table(o, &["x", "id", "status", "digits", "factors"], &rows, 0);
+        table(o, &["x", "term", "number", "status", "factors"], &rows, 0);
     } else {
-        table(o, &["x", "id", "status", "digits"], &rows, 0);
+        table(o, &["x", "term", "number", "status"], &rows, 0);
     }
+}
+
+/// Words the family grammar reads as functions (any case), longest first: their letters are not
+/// the family variable and are never substituted.
+const FAMILY_WORDS: [&str; 4] = ["fibonacci", "lucas", "fib", "odd"];
+
+fn family_word_at(b: &[u8], i: usize) -> Option<usize> {
+    FAMILY_WORDS.iter().find(|w| b.get(i..i + w.len()).is_some_and(|s| s.eq_ignore_ascii_case(w.as_bytes()))).map(|w| w.len())
+}
+
+/// The family variable: the one lowercase letter outside the function words (None for none or
+/// several), as the server and the family page find it.
+fn family_variable(expr: &str) -> Option<u8> {
+    let b = expr.as_bytes();
+    let (mut found, mut i) = (None, 0);
+    while i < b.len() {
+        if let Some(len) = family_word_at(b, i) {
+            i += len;
+            continue;
+        }
+        if b[i].is_ascii_lowercase() {
+            match found {
+                None => found = Some(b[i]),
+                Some(c) if c != b[i] => return None,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The family member at `x` as the family page writes it: the variable replaced by the value, bare
+/// where it is a whole bracket or argument (`lucas(3)`), else in brackets (`2^(59)-1`); a negative
+/// value as `0-|x|` (the grammar has no unary minus).
+fn family_member_term(expr: &str, var: u8, x: i64) -> String {
+    let inner = if x < 0 { format!("0-{}", x.unsigned_abs()) } else { x.to_string() };
+    let b = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(len) = family_word_at(b, i) {
+            out.push_str(&expr[i..i + len]);
+            i += len;
+            continue;
+        }
+        if b[i] == var {
+            let before = i.checked_sub(1).map(|j| b[j]);
+            let after = b.get(i + 1).copied();
+            if matches!(before, Some(b'(' | b',')) && matches!(after, Some(b')' | b',')) {
+                out.push_str(&inner);
+            } else {
+                out.push('(');
+                out.push_str(&inner);
+                out.push(')');
+            }
+        } else {
+            out.push(b[i] as char);
+        }
+        i += 1;
+    }
+    out
 }
 
 /// A report_factors result on one line, for the bulk `report-file` output: the number's id, its
@@ -1723,4 +1803,22 @@ fn r_quota(o: &mut String, v: &Value) {
     kv.add("background checks", cap(ms_h(u(v, "check_used_ms")), u(v, "check_cap_ms"), ms_h(u(v, "check_cap_ms"))));
     kv.add("window resets in", secs_h(u(v, "reset_secs")));
     kv.write(o, 0);
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    #[test]
+    fn member_terms_like_the_family_page() {
+        let t = |e: &str, x: i64| family_member_term(e, family_variable(e).expect("variable"), x);
+        assert_eq!(t("2^n-1", 59), "2^(59)-1");
+        assert_eq!(t("lucas(n)", 3), "lucas(3)");
+        assert_eq!(t("I(3,n)", 9), "I(3,9)");
+        assert_eq!(t("fib(k)+k", 4), "fib(4)+(4)");
+        assert_eq!(t("10^10+x", -100), "10^10+(0-100)");
+        assert_eq!(t("n?+1", 5), "(5)?+1");
+        assert_eq!(family_variable("2^n+m"), None);
+        assert_eq!(family_variable("ODD(n)*Fibonacci(n)"), Some(b'n'));
+    }
 }
