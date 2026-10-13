@@ -690,14 +690,14 @@ fn r_family(o: &mut String, v: &Value, expr: Option<&str>) {
     let rows: Vec<Vec<String>> = arr(v, "members")
         .iter()
         .map(|m| {
+            // x is a JSON number within 64 bits, a decimal string beyond
             let x = n(m, "x");
-            let xi = m.get("x").and_then(Value::as_i64).unwrap_or(0);
             // the server's display term (constants folded, needed brackets only), else our substitution
             let term = if !s(m, "term").is_empty() {
                 s(m, "term").to_string()
             } else {
                 match (expr, var) {
-                    (Some(e), Some(c)) => family_member_term(e, c, xi),
+                    (Some(e), Some(c)) => family_member_term(e, c, &x),
                     _ => String::new(),
                 }
             };
@@ -763,8 +763,11 @@ fn family_variable(expr: &str) -> Option<u8> {
 /// The family member at `x` as the family page writes it: the variable replaced by the value, bare
 /// where it is a whole bracket or argument (`lucas(3)`), else in brackets (`2^(59)-1`); a negative
 /// value as `0-|x|` (the grammar has no unary minus).
-fn family_member_term(expr: &str, var: u8, x: i64) -> String {
-    let inner = if x < 0 { format!("0-{}", x.unsigned_abs()) } else { x.to_string() };
+fn family_member_term(expr: &str, var: u8, x: &str) -> String {
+    let inner = match x.strip_prefix('-') {
+        Some(abs) => format!("0-{abs}"),
+        None => x.to_string(),
+    };
     let b = expr.as_bytes();
     let mut out = String::with_capacity(expr.len() + 8);
     let mut i = 0;
@@ -1822,13 +1825,14 @@ mod family_tests {
 
     #[test]
     fn member_terms_like_the_family_page() {
-        let t = |e: &str, x: i64| family_member_term(e, family_variable(e).expect("variable"), x);
-        assert_eq!(t("2^n-1", 59), "2^(59)-1");
-        assert_eq!(t("lucas(n)", 3), "lucas(3)");
-        assert_eq!(t("I(3,n)", 9), "I(3,9)");
-        assert_eq!(t("fib(k)+k", 4), "fib(4)+(4)");
-        assert_eq!(t("10^10+x", -100), "10^10+(0-100)");
-        assert_eq!(t("n?+1", 5), "(5)?+1");
+        let t = |e: &str, x: &str| family_member_term(e, family_variable(e).expect("variable"), x);
+        assert_eq!(t("2^n-1", "59"), "2^(59)-1");
+        assert_eq!(t("lucas(n)", "3"), "lucas(3)");
+        assert_eq!(t("I(3,n)", "9"), "I(3,9)");
+        assert_eq!(t("fib(k)+k", "4"), "fib(4)+(4)");
+        assert_eq!(t("10^10+x", "-100"), "10^10+(0-100)");
+        assert_eq!(t("n?+1", "5"), "(5)?+1");
+        assert_eq!(t("10^40+n", "-999999999999999999999999999999"), "10^40+(0-999999999999999999999999999999)");
         assert_eq!(family_variable("2^n+m"), None);
         assert_eq!(family_variable("ODD(n)*Fibonacci(n)"), Some(b'n'));
     }

@@ -79,6 +79,25 @@ fn parse_pct(s: &str) -> std::result::Result<u16, String> {
     Ok((p * 100.0).round() as u16)
 }
 
+/// `family --start`: an integer of any size, as a canonical decimal string (`007` -> `7`, `-0` ->
+/// `0`); the server says when it is too large.
+fn parse_big_int(s: &str) -> std::result::Result<String, String> {
+    let t = s.trim();
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("'{s}' is not an integer"));
+    }
+    let d = digits.trim_start_matches('0');
+    Ok(match (d.is_empty(), neg) {
+        (true, _) => "0".into(),
+        (false, true) => format!("-{d}"),
+        (false, false) => d.into(),
+    })
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     // ---- Numbers & factors ----
@@ -150,8 +169,8 @@ enum Cmd {
         /// Family expression with one lowercase letter as the variable, e.g. 2^x-1 or 10^n+1
         expr: String,
         /// First index (may be negative)
-        #[arg(long, default_value_t = 1, allow_negative_numbers = true)]
-        start: i64,
+        #[arg(long, default_value = "1", allow_negative_numbers = true, value_parser = parse_big_int)]
+        start: String,
         /// How many members to list (at most 1000)
         #[arg(long, default_value_t = 20)]
         limit: u32,
@@ -929,6 +948,8 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
         Cmd::Algebraic { target: t } => ctx.simple("algebraic_factors", json!({ "target": target(&t)? })),
         Cmd::Family { expr, start, limit, factors } => {
             // rendered with the expression, for each member's term; --json prints the reply as it is
+            // a JSON number while it fits in 64 bits, else the decimal string the server also takes
+            let start = start.parse::<i64>().map(Value::from).unwrap_or(Value::String(start));
             let v = ctx.client.call("get_family", json!({ "expr": expr, "start": start, "limit": limit, "factors": factors }))?;
             if ctx.json {
                 ctx.print_json(&v);
