@@ -206,9 +206,15 @@ fn date_utc(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60)
 }
 
-/// A status code with its meaning. ff is the number's fully_factored flag when the reply
+/// A status code with its meaning. ff says whether the factorization is complete (from the status) when the reply
 /// carries one: a literal (> 10^18) always comes back as "C", so "no factor known" is only claimed
 /// when the reply says the number is not fully factored.
+/// Whether a status says the factorization is complete (P, PRP, FF) - the server sends the effective
+/// status, FF for a complete composite
+fn complete(st: &str) -> bool {
+    matches!(st, "P" | "PRP" | "FF")
+}
+
 fn status_text(st: &str, ff: Option<bool>) -> String {
     match st {
         "P" => "P (prime)".into(),
@@ -516,7 +522,7 @@ fn r_get_id(o: &mut String, v: &Value) {
 fn r_number(o: &mut String, v: &Value) {
     let id = v.get("id").cloned().unwrap_or(Value::Null);
     let flag_txt = if b(v, "perfect_power") { "  (perfect power)" } else { "" };
-    let status = status_text(s(v, "status"), Some(b(v, "fully_factored")));
+    let status = status_text(s(v, "status"), Some(complete(s(v, "status"))));
     let _ = writeln!(o, "{}  {}  {} digits{}", id_label(&id), status, commas(u(v, "digits")), flag_txt);
     let mut kv = Kv::new();
     let term = s(v, "term");
@@ -540,7 +546,7 @@ fn r_number(o: &mut String, v: &Value) {
         effort_kv(level).write(o, 2);
     }
     if let Some(f) = v.get("factors") {
-        let _ = writeln!(o, "\nfactors  [{}]", status_text(s(f, "status"), Some(b(f, "fully_factored"))));
+        let _ = writeln!(o, "\nfactors  [{}]", status_text(s(f, "status"), Some(complete(s(f, "status")))));
         factor_lines(o, f, 2);
     }
     if let Some(p) = v.get("primality") {
@@ -559,7 +565,7 @@ fn r_number(o: &mut String, v: &Value) {
 
 fn r_factors(o: &mut String, v: &Value) {
     let id = v.get("id").cloned().unwrap_or(Value::Null);
-    let _ = writeln!(o, "{}  {}", id_label(&id), status_text(s(v, "status"), Some(b(v, "fully_factored"))));
+    let _ = writeln!(o, "{}  {}", id_label(&id), status_text(s(v, "status"), Some(complete(s(v, "status")))));
     factor_lines(o, v, 2);
 }
 
@@ -686,9 +692,14 @@ fn r_family(o: &mut String, v: &Value, expr: Option<&str>) {
         .map(|m| {
             let x = n(m, "x");
             let xi = m.get("x").and_then(Value::as_i64).unwrap_or(0);
-            let term = match (expr, var) {
-                (Some(e), Some(c)) => family_member_term(e, c, xi),
-                _ => String::new(),
+            // the server's display term (constants folded, needed brackets only), else our substitution
+            let term = if !s(m, "term").is_empty() {
+                s(m, "term").to_string()
+            } else {
+                match (expr, var) {
+                    (Some(e), Some(c)) => family_member_term(e, c, xi),
+                    _ => String::new(),
+                }
             };
             let mut row = match m.get("member") {
                 Some(mem) if !mem.is_null() => {
