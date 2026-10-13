@@ -732,7 +732,7 @@ fn r_family(o: &mut String, v: &Value, expr: Option<&str>) {
 
 /// Words the family grammar reads as functions (any case), longest first: their letters are not
 /// the family variable and are never substituted.
-const FAMILY_WORDS: [&str; 4] = ["fibonacci", "lucas", "fib", "odd"];
+const FAMILY_WORDS: [&str; 12] = ["carmichaellambda", "dedekindpsi", "fibonacci", "eulerphi", "bigomega", "omega", "sigma", "lucas", "core", "fib", "odd", "rad"];
 
 fn family_word_at(b: &[u8], i: usize) -> Option<usize> {
     FAMILY_WORDS.iter().find(|w| b.get(i..i + w.len()).is_some_and(|s| s.eq_ignore_ascii_case(w.as_bytes()))).map(|w| w.len())
