@@ -1820,32 +1820,46 @@ fn parse_report_file(text: &str, from_line: usize) -> (Vec<BulkReport>, Vec<Stri
                 continue; // a comment
             }
         }
-        let parsed = match l.split_once('=') {
-            None => Err("no '=' (expected NUMBER=FACTOR)".to_string()),
-            Some((num, fac)) => {
-                let (num, fac) = (num.trim(), fac.trim());
-                if num.is_empty() {
-                    Err("no number before '='".to_string())
-                } else if fac.is_empty() {
-                    Err("no factor after '='".to_string())
-                } else if fac.contains('=') {
-                    Err("more than one '='".to_string())
-                } else {
-                    match target(num) {
-                        Ok(t) => Ok((num, t, fac)),
-                        Err(e) => Err(e.to_string()),
+        // GMP-ECM's result line (`ecm -q`): the factors of its input, space-separated, without the
+        // input itself - the number reported is their product.
+        let words: Vec<&str> = l.split_whitespace().collect();
+        let gmp_ecm = !l.contains('=') && words.iter().all(|w| w.bytes().all(|b| b.is_ascii_digit()));
+        let parsed: std::result::Result<(String, Value, Vec<String>), String> = if gmp_ecm && words.len() >= 2 {
+            let num = words.join("*");
+            match target(&num) {
+                Ok(t) => Ok((num, t, words.iter().map(|w| w.to_string()).collect())),
+                Err(e) => Err(e.to_string()),
+            }
+        } else if gmp_ecm {
+            Err("a lone number - nothing to report".to_string())
+        } else {
+            match l.split_once('=') {
+                None => Err("no '=' (expected NUMBER=FACTOR, or the factors of one number separated by spaces)".to_string()),
+                Some((num, fac)) => {
+                    let (num, fac) = (num.trim(), fac.trim());
+                    if num.is_empty() {
+                        Err("no number before '='".to_string())
+                    } else if fac.is_empty() {
+                        Err("no factor after '='".to_string())
+                    } else if fac.contains('=') {
+                        Err("more than one '='".to_string())
+                    } else {
+                        match target(num) {
+                            Ok(t) => Ok((num.to_string(), t, vec![fac.to_string()])),
+                            Err(e) => Err(e.to_string()),
+                        }
                     }
                 }
             }
         };
         match parsed {
             Err(why) => bad.push(format!("line {line}: {why}")),
-            Ok((num, t, fac)) => match out.last_mut() {
+            Ok((num, t, facs)) => match out.last_mut() {
                 Some(prev) if prev.number == num && prev.factors.len() < BULK_MAX_FACTORS => {
-                    prev.factors.push(fac.to_string());
+                    prev.factors.extend(facs);
                     prev.last_line = line;
                 }
-                _ => out.push(BulkReport { line, last_line: line, number: num.to_string(), target: t, factors: vec![fac.to_string()] }),
+                _ => out.push(BulkReport { line, last_line: line, number: num, target: t, factors: facs }),
             },
         }
     }
@@ -2333,6 +2347,25 @@ mod tests {
         }
         let (r, skipped) = parse_report_file("# only comments\n\n", 1);
         assert!(r.is_empty() && skipped.is_empty());
+    }
+
+    #[test]
+    fn report_file_takes_gmp_ecm_result_lines() {
+        // `ecm -q` prints the factors of its input without the input: the product is the number
+        let text = "1009 1000003\n  193707721   761838257287 \n7=7\n1000000007\n";
+        let (r, bad) = parse_report_file(text, 1);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].number, "1009*1000003");
+        assert_eq!(r[0].target, json!({ "expr": "1009*1000003" }));
+        assert_eq!(r[0].factors, vec!["1009", "1000003"]);
+        assert_eq!(r[1].number, "193707721*761838257287");
+        assert_eq!(r[1].factors, vec!["193707721", "761838257287"]);
+        assert_eq!(r[2].factors, vec!["7"]);
+        // a lone number (no factor found) is skipped with a note; three factors make one report
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].starts_with("line 4:") && bad[0].contains("lone number"), "{}", bad[0]);
+        let (r, _) = parse_report_file("3 5 7\n", 1);
+        assert_eq!((r[0].number.as_str(), r[0].factors.len()), ("3*5*7", 3));
     }
 
     /// Every visible subcommand is placed in a reference group (so nothing is left undocumented).

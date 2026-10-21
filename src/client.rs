@@ -302,7 +302,7 @@ fn scrub(v: &Value) -> String {
 /// Parse a command-line target: id:N, fid:N or #N address a stored id; anything else is an expression (2^127-1, 150!+1, a decimal number).
 pub fn target(s: &str) -> Result<Value> {
     let t = s.trim();
-    for prefix in ["id:", "fid:", "#"] {
+    for prefix in ["id:", "fid:"] {
         if let Some(rest) = t.strip_prefix(prefix) {
             return match rest.trim().parse::<u64>() {
                 Ok(n) => Ok(json!({ "id": n })),
@@ -310,8 +310,42 @@ pub fn target(s: &str) -> Result<Value> {
             };
         }
     }
+    if let Some(rest) = t.strip_prefix('#') {
+        if let Ok(n) = rest.trim().parse::<u64>() {
+            return Ok(json!({ "id": n }));
+        }
+        let r = rest.trim_start();
+        let after = r.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start();
+        if after.len() == r.len() || !after.starts_with(|c: char| "+-*/^%!#?|\\(),".contains(c)) {
+            return Err(Error::Usage(format!("'{s}': an id must be a non-negative integer after '#'")));
+        }
+        return Ok(json!({ "expr": t }));
+    }
     if t.is_empty() {
         return Err(Error::Usage("empty target".into()));
     }
     Ok(json!({ "expr": t }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `#N` alone is an id; `#N` in a longer expression goes to the server as the expression.
+    #[test]
+    fn targets_with_ids() {
+        assert_eq!(target("#1100000010684258087").unwrap(), json!({ "id": 1100000010684258087u64 }));
+        assert_eq!(target(" # 1100000010684258087 ").unwrap(), json!({ "id": 1100000010684258087u64 }));
+        assert_eq!(target("id:42").unwrap(), json!({ "id": 42 }));
+        assert_eq!(target("fid:42").unwrap(), json!({ "id": 42 }));
+        assert_eq!(target("#1100000010684258087-1").unwrap(), json!({ "expr": "#1100000010684258087-1" }));
+        assert_eq!(target("#1100000000000000001*#1100000000000000002").unwrap(), json!({ "expr": "#1100000000000000001*#1100000000000000002" }));
+        assert_eq!(target("2^127-1").unwrap(), json!({ "expr": "2^127-1" }));
+        assert!(target("#abc").is_err());
+        assert!(target("#12x").is_err());
+        assert_eq!(target("#12 + 1").unwrap(), json!({ "expr": "#12 + 1" }));
+        assert!(target("#").is_err());
+        assert!(target("id:12x").is_err());
+        assert!(target("").is_err());
+    }
 }
