@@ -632,6 +632,10 @@ enum SeqCmd {
         /// Only sequences whose frontier has exactly this guide value (finer than --driver)
         #[arg(long, value_name = "GUIDE")]
         guide: Option<u64>,
+        /// Every start up to this power of ten at once, all start ranges below it merged (10^3 to
+        /// 10^66, written 10^6, 1e6 or 1000000); replaces --category and --offset
+        #[arg(long, value_name = "BOUND", value_parser = parse_start_bound, conflicts_with_all = ["category", "offset"])]
+        to: Option<u8>,
     },
     /// Which sequences a number is a term of [sequence_of]
     Of {
@@ -877,9 +881,14 @@ impl Ctx {
 fn main() {
     // Behave like a Unix filter: exit quietly when the reader goes away (`fdb seq get | head`)
     // instead of panicking on the broken pipe.
+    // And keep running in the background (`fdb report-file f &`): with `stty tostop` the terminal
+    // stops a background job at its first output (SIGTTOU), again after every SIGCONT. Ignored, the
+    // output simply goes to the terminal. SIGTTIN stays: a background job that needs input (a
+    // password, `report-file -`) still stops and waits for `fg`.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
     // `fdb --help` / `fdb help` / a bare `fdb` show the full reference (every command with all of
     // its options), generated from the command definitions so it cannot drift from them.
@@ -1533,8 +1542,12 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             let start = resolve_start(ctx, &start)?;
             ctx.simple_long("extend_sequence", json!({ "start": start, "steps": steps, "type": kind }))
         }
-        SeqCmd::List { limit, offset, kind, category, end, sort, dir, driver, guide } => {
-            let mut p = json!({ "limit": limit, "offset": offset, "type": kind, "category": category });
+        SeqCmd::List { limit, offset, kind, category, end, sort, dir, driver, guide, to } => {
+            let mut p = match to {
+                // the server merges the start categories 0..=max_category (category n = up to 10^(n+3))
+                Some(max_category) => json!({ "limit": limit, "type": kind, "all": true, "max_category": max_category }),
+                None => json!({ "limit": limit, "offset": offset, "type": kind, "category": category }),
+            };
             if let Some(g) = guide {
                 p["guide"] = json!(g);
             }
@@ -2063,6 +2076,23 @@ fn seq_type_catalog() -> Vec<(u8, String, String)> {
     rows
 }
 
+/// `--to` of `seq list`: a power of ten 10^k (3 <= k <= 66) as `10^k`, `1ek` or `1000…0`, turned into
+/// the last start category it covers (k - 3; the server's last one, 63, holds everything above 10^65).
+fn parse_start_bound(input: &str) -> std::result::Result<u8, String> {
+    let t = input.trim().to_ascii_lowercase();
+    let k = if let Some(e) = t.strip_prefix("10^").or_else(|| t.strip_prefix("1e")) {
+        e.parse::<u32>().ok()
+    } else if t.len() > 1 && t.starts_with('1') && t[1..].bytes().all(|b| b == b'0') {
+        Some(t.len() as u32 - 1)
+    } else {
+        None
+    };
+    match k {
+        Some(k @ 3..=66) => Ok((k - 3) as u8),
+        _ => Err(format!("{input:?} is not a power of ten from 10^3 to 10^66 (e.g. 10^6, 1e6 or 1000000)")),
+    }
+}
+
 /// `--type`: a catalogue code or name. Names are matched ignoring case, spaces, `-` and `_`, and
 /// the long forms `home-prime-10` / `inverse-home-prime-3` are accepted too.
 fn parse_seq_type(input: &str) -> std::result::Result<u8, String> {
@@ -2291,6 +2321,21 @@ fn wrap_first(o: &mut String, first: &str, text: &str, indent: usize, width: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_list_to_is_a_power_of_ten() {
+        // category n covers starts up to 10^(n+3): 10^6 is the last start of category 3
+        assert_eq!(parse_start_bound("10^6"), Ok(3));
+        assert_eq!(parse_start_bound("1e7"), Ok(4));
+        assert_eq!(parse_start_bound("1E18"), Ok(15));
+        assert_eq!(parse_start_bound("1000000"), Ok(3));
+        assert_eq!(parse_start_bound("1000"), Ok(0));
+        assert_eq!(parse_start_bound("10^66"), Ok(63));
+        assert!(parse_start_bound("100").is_err());
+        assert!(parse_start_bound("10^67").is_err());
+        assert!(parse_start_bound("2000000").is_err());
+        assert!(parse_start_bound("10^x").is_err());
+    }
 
     #[test]
     fn max_pct_is_hundredths() {
