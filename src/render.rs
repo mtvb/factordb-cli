@@ -22,6 +22,7 @@ pub fn render(method: &str, v: &Value) -> String {
         "report_factors" => r_report(&mut o, v),
         "check_factors" => r_check_factors(&mut o, v),
         "snfs_poly" => crate::snfs::list(&mut o, v),
+        "snfs_side_numbers" => r_snfs_side_numbers(&mut o, v),
         "prove" => r_prove(&mut o, v),
         "proof_progress" => r_proof_progress(&mut o, v),
         "proof_state" => r_proof_state(&mut o, v),
@@ -1692,6 +1693,54 @@ fn r_prp_candidates(o: &mut String, v: &Value) {
     }
     if b(v, "has_more") {
         o.push_str("(more rows available, raise --offset)\n");
+    }
+}
+
+/// The numbers on one shared SNFS side, cheapest own side first.
+fn r_snfs_side_numbers(o: &mut String, v: &Value) {
+    let side = if s(v, "side") == "algebraic" {
+        let c: Vec<&str> = arr(v, "c").iter().filter_map(Value::as_str).collect();
+        format!("algebraic, f = {}", crate::snfs::poly_text(&c))
+    } else {
+        let (y1, y0) = (s(v, "y1"), s(v, "y0"));
+        let tail = match y0.strip_prefix('-') {
+            Some(m) => format!("- {m}"),
+            None => format!("+ {y0}"),
+        };
+        if y1 == "1" { format!("rational, g = x {tail}") } else { format!("rational, g = {y1}*x {tail}") }
+    };
+    let _ = writeln!(o, "side     {side}");
+    let _ = writeln!(o, "numbers  {} in the index", commas(u(v, "total")));
+    let rows: Vec<Vec<String>> = arr(v, "numbers")
+        .iter()
+        .map(|n| {
+            let state = match (s(n, "status"), n.get("open_digits").and_then(Value::as_u64)) {
+                ("CF", Some(d)) => format!("CF, open {}", commas(d)),
+                (st, _) => st.to_string(),
+            };
+            let num = |k: &str| n.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+            vec![
+                fid_label(n, "id"),
+                commas(u(n, "digits")),
+                state,
+                u(n, "degree").to_string(),
+                format!("{:.1}", num("difficulty")),
+                format!("{:.1}", num("cost")),
+                number_text(n),
+            ]
+        })
+        .collect();
+    if rows.is_empty() {
+        o.push_str("(no open number of the factor tables on this side)\n");
+    } else {
+        table(o, &["id", "digits", "state", "deg", "difficulty", "own side", "number"], &rows, 0);
+        o.push_str("own side = digits of the norm of each number's other side (the one not shared) at |a|, |b| about 10^9\n");
+    }
+    if b(v, "cut") {
+        o.push_str("(this page ran out of time)\n");
+    }
+    if let Some(next) = v.get("next").and_then(Value::as_u64) {
+        let _ = writeln!(o, "(more numbers: --offset {next})");
     }
 }
 

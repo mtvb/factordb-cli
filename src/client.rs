@@ -189,6 +189,10 @@ impl Client {
         let mut resp = req.send(&body[..]).map_err(|e| Error::Transport(format!("{}: {}", self.url, describe(e))))?;
         let status = resp.status().as_u16();
         let resources = resp.headers().get("x-fdb-resources").and_then(|v| v.to_str().ok()).map(str::to_owned);
+        // (a refusal - a blocked address - carries the message in its text already)
+        if let Some(n) = resp.headers().get("x-fdb-notice").and_then(|v| v.to_str().ok()).filter(|_| (200..=299).contains(&status)) {
+            show_notice(n);
+        }
         let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse().ok());
         // No body cap: a certificate download or a full decimal expansion can run to hundreds of MB.
         let text = resp
@@ -347,5 +351,45 @@ mod tests {
         assert!(target("#").is_err());
         assert!(target("id:12x").is_err());
         assert!(target("").is_err());
+    }
+}
+
+
+/// A message the site's operator addressed to this address or account (the `X-Fdb-Notice` header,
+/// percent-encoded UTF-8): printed on stderr, once per run.
+fn show_notice(encoded: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if !SHOWN.swap(true, Ordering::Relaxed) {
+        eprintln!("Message from the factordb operator: {}", pct_decode(encoded));
+    }
+}
+
+/// Percent-decoding (`%XX` -> byte), the bytes read as UTF-8.
+fn pct_decode(encoded: &str) -> String {
+    let b = encoded.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod notice_tests {
+    #[test]
+    fn notice_header_is_decoded() {
+        assert_eq!(super::pct_decode("Hello%2C%20w%C3%B6rld%20-%20100%25"), "Hello, wörld - 100%");
+        assert_eq!(super::pct_decode("50%"), "50%");
     }
 }

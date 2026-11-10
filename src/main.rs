@@ -242,6 +242,45 @@ enum Cmd {
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
     },
+    /// Which numbers can my SNFS side factor? For the factorization factory: the numbers of the factor
+    /// tables with an SNFS polynomial on one shared side - a rational side (--m, or --y0 with --y1; the
+    /// numbers' own f of degree 3 to 9) or an algebraic side (--f) - cheapest own side first [snfs_side_numbers]
+    #[command(group(clap::ArgGroup::new("side").required(true).args(["m", "y0", "f"])))]
+    SnfsSide {
+        /// The rational side g = x - M: a number or an expression (10^42, 2^161)
+        #[arg(long, value_name = "M", allow_hyphen_values = true)]
+        m: Option<String>,
+        /// The rational side g = Y1*x + Y0: Y0 as a decimal (e.g. -1000000000000000000000000000000000000)
+        #[arg(long, value_name = "Y0", allow_hyphen_values = true, conflicts_with = "m")]
+        y0: Option<String>,
+        /// With --y0: Y1 as a decimal (default 1)
+        #[arg(long, value_name = "Y1", allow_hyphen_values = true, requires = "y0")]
+        y1: Option<String>,
+        /// The algebraic side f = c0 + c1*x + ... + cd*x^d as c0,c1,...,cd (7,0,0,0,0,0,1 = x^6+7)
+        #[arg(long, value_name = "C0,..,CD", allow_hyphen_values = true, conflicts_with_all = ["m", "y0"])]
+        f: Option<String>,
+        /// Only numbers of at least this many digits
+        #[arg(long, value_name = "N")]
+        min_digits: Option<u64>,
+        /// Only numbers of at most this many digits
+        #[arg(long, value_name = "N")]
+        max_digits: Option<u64>,
+        /// Rational side only: the lowest degree of the numbers' own f (3 to 9)
+        #[arg(long, value_name = "D", conflicts_with = "f")]
+        min_degree: Option<u64>,
+        /// Rational side only: the highest degree of the numbers' own f
+        #[arg(long, value_name = "D", conflicts_with = "f")]
+        max_degree: Option<u64>,
+        /// Also numbers fully factored or prime by now (the index drops them weekly)
+        #[arg(long)]
+        all: bool,
+        /// Position in the list to start from (the "--offset N" the previous page names)
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        /// Numbers per page, maximum 1000
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+    },
     /// Per-method completeness and the cost of proving a number [proof_progress]
     ProofProgress {
         #[arg(help = TARGET_HELP)]
@@ -621,7 +660,7 @@ enum SeqCmd {
         #[arg(long, value_parser = ["open", "merge", "cycle", "terminus", "all", "merge-open", "merge-terminus", "merge-cycle"], value_name = "KIND")]
         end: Option<String>,
         /// Sort column
-        #[arg(long, value_parser = ["length", "start", "driver"])]
+        #[arg(long, value_parser = ["length", "start", "driver", "composite"])]
         sort: Option<String>,
         /// Sort direction
         #[arg(long, value_parser = ["asc", "desc"])]
@@ -1044,6 +1083,29 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
                 None => print!("{text}"),
             }
             Ok(())
+        }
+        Cmd::SnfsSide { m, y0, y1, f, min_digits, max_digits, min_degree, max_degree, all, offset, limit } => {
+            let mut p = json!({ "offset": offset, "limit": limit });
+            match (m, y0, f) {
+                (Some(m), None, None) => p["m"] = json!(m),
+                (None, Some(y0), None) => {
+                    p["y0"] = json!(y0);
+                    if let Some(y1) = y1 {
+                        p["y1"] = json!(y1);
+                    }
+                }
+                (None, None, Some(f)) => p["c"] = json!(f.split(',').map(str::trim).collect::<Vec<_>>()),
+                _ => return Err(Error::Usage("give one side: --m M, --y0 Y0 [--y1 Y1] or --f C0,..,CD".into())),
+            }
+            for (k, v) in [("min_digits", min_digits), ("max_digits", max_digits), ("min_degree", min_degree), ("max_degree", max_degree)] {
+                if let Some(v) = v {
+                    p[k] = json!(v);
+                }
+            }
+            if all {
+                p["all"] = json!(true);
+            }
+            ctx.simple("snfs_side_numbers", p)
         }
         Cmd::ProofProgress { target: t } => ctx.simple_long("proof_progress", json!({ "target": target(&t)? })),
         Cmd::ProofState { target: t, wait, interval } => {
@@ -2129,7 +2191,7 @@ fn print_seq_types() {
 const GROUPS: &[(&str, &[&str])] = &[
     ("Numbers & factors", &["id", "number", "factors", "factor-of", "nextprime", "prevprime", "primality", "algebraic", "family", "report", "report-file"]),
     ("Primality proofs", &["prove", "proof-progress", "proof-state", "proof-list"]),
-    ("Factoring", &["check-factors", "snfs"]),
+    ("Factoring", &["check-factors", "snfs", "snfs-side"]),
     ("Probable-prime tests", &["prp-test", "prp-test-info"]),
     ("Certificates", &["cert"]),
     ("Sequences", &["seq"]),
