@@ -23,6 +23,7 @@ pub fn render(method: &str, v: &Value) -> String {
         "check_factors" => r_check_factors(&mut o, v),
         "snfs_poly" => crate::snfs::list(&mut o, v),
         "snfs_side_numbers" => r_snfs_side_numbers(&mut o, v),
+        "snfs_siblings" => r_snfs_siblings(&mut o, v),
         "prove" => r_prove(&mut o, v),
         "proof_progress" => r_proof_progress(&mut o, v),
         "proof_state" => r_proof_state(&mut o, v),
@@ -52,12 +53,16 @@ pub fn render(method: &str, v: &Value) -> String {
         "list_by_type" => r_list_by_type(&mut o, v),
         "prp_candidates" => r_prp_candidates(&mut o, v),
         "ecm_list" => r_ecm_list(&mut o, v),
+        "ecm_finds" => r_ecm_finds(&mut o, v),
+        "report_ecm" => r_report_ecm(&mut o, v),
+        "worker_queue" => r_worker_queue(&mut o, v),
         "ecm_group_order" => r_group_order(&mut o, v),
         "download" => r_download(&mut o, v),
         "primo_batch" => r_primo_batch(&mut o, v),
         "login" | "register" | "regenerate_token" => r_session(&mut o, v),
         "whoami" => r_whoami(&mut o, v),
         "logout" => o.push_str("logged out\n"),
+        "change_password" => r_change_password(&mut o, v),
         "quota_status" => r_quota(&mut o, v),
         "contributions" => r_contributions(&mut o, v),
         "health" => writeln!(o, "{}", if s(v, "status") == "ok" { "ok" } else { "unhealthy" }).unwrap(),
@@ -287,15 +292,20 @@ fn proof_type_name(t: i64) -> &'static str {
         1 => "N-1",
         2 => "N+1",
         3 => "combined",
+        4 => "N-1 (KP)", // Konyagin-Pomerance
         _ => "?",
     }
 }
+/// An ecmfac type: 1 = ECM with GMP-ECM param 0, 5..7 = params 1..3 (the core's ecm_type_of).
 fn ecm_type_name(t: i64) -> &'static str {
     match t {
         1 => "ECM (Montgomery)",
         2 => "P-1",
         3 => "P+1",
         4 => "ECM (Edwards)",
+        5 => "ECM (param 1)",
+        6 => "ECM (param 2)",
+        7 => "ECM (param 3)",
         _ => "?",
     }
 }
@@ -504,6 +514,10 @@ fn factor_lines(o: &mut String, f: &Value, indent: usize) {
         if has(x, "fid") {
             let _ = write!(line, "  #{}", u(x, "fid"));
         }
+        // the account credited for finding this factor
+        if !s(x, "credited_to").is_empty() {
+            let _ = write!(line, "  found by {}", s(x, "credited_to"));
+        }
         let _ = writeln!(o, "{line}");
     }
 }
@@ -609,12 +623,15 @@ fn effort_kv(level: u64) -> Kv {
 
 fn primality_kv(v: &Value) -> Kv {
     let kind = s(v, "kind");
+    // variant "kp": the N-1 proof is the Konyagin-Pomerance one (N-1 factored to between 3/10 and 1/3)
+    let kp = s(v, "variant") == "kp";
     let desc = match kind {
         "needs_proof" => "probable prime, no proof yet",
         "cert_pending" => "certificate uploaded, verification pending",
         "direct" => "proven directly",
         "certificate" => "proven by primality certificate",
         "chain_step" => "proven as a step of another number's certificate chain",
+        "n-1" if kp => "Konyagin-Pomerance N-1 proof",
         "n-1" => "Pocklington N-1 proof",
         "n+1" => "Morrison N+1 proof",
         "combined" => "combined N-1 / N+1 (BLS75) proof",
@@ -634,12 +651,28 @@ fn primality_kv(v: &Value) -> Kv {
     // A chain step: whose certificate, which step of how many recorded ones.
     if has(v, "chain_fid") {
         kv.add("certificate of", format!("#{} ({} digits)", u(v, "chain_fid"), commas(u(v, "chain_digits"))));
-        kv.add("chain step", format!("{} of {}", commas(u(v, "chain_step")), commas(u(v, "chain_steps"))));
+        if has(v, "chain_index") {
+            // the step number, and where it stands among the steps on file (the window of `cert chain`)
+            let idx = u(v, "chain_index");
+            kv.add("chain step", commas(u(v, "chain_step")));
+            kv.add(
+                "chain position",
+                format!(
+                    "{} of {} steps on file (fdb cert chain id:{} --skip {idx} --limit 1)",
+                    commas(idx + 1),
+                    commas(u(v, "chain_steps")),
+                    u(v, "chain_fid")
+                ),
+            );
+        } else {
+            kv.add("chain step", format!("{} of {}", commas(u(v, "chain_step")), commas(u(v, "chain_steps"))));
+        }
     }
     // A second recorded proof next to a certificate (N-1 / N+1 / combined), with its witness base.
     if let Some(a) = v.get("also_proof") {
         let ak = s(a, "kind");
         let adesc = match ak {
+            "n-1" if s(a, "variant") == "kp" => "Konyagin-Pomerance N-1 proof",
             "n-1" => "Pocklington N-1 proof",
             "n+1" => "Morrison N+1 proof",
             "combined" => "combined N-1 / N+1 (BLS75) proof",
@@ -1088,14 +1121,29 @@ fn r_cert_chain(o: &mut String, v: &Value) {
         table(o, &["step", "digits"], &rows, 0);
         return;
     }
+    // `drop`: the digits this step removed (from the step before, or the certified number itself
+    // for the first step on file), with the same in bits when both values could be read
+    let with_drop = chain.iter().any(|c| has(c, "drop"));
     let rows: Vec<Vec<String>> = chain
         .iter()
         .map(|c| {
             let text = if s(c, "term").is_empty() { truncate(s(c, "preview"), 40) } else { truncate(s(c, "term"), 40) };
-            vec![n(c, "step"), fid_label(c, "tofid"), commas(u(c, "digits")), n(c, "type"), text]
+            let mut row = vec![n(c, "step"), fid_label(c, "tofid"), commas(u(c, "digits"))];
+            if with_drop {
+                row.push(if has(c, "drop") { commas_i(i(c, "drop")) } else { "-".into() });
+                row.push(if has(c, "drop_bits") { commas_i(i(c, "drop_bits")) } else { "-".into() });
+            }
+            row.push(n(c, "type"));
+            row.push(text);
+            row
         })
         .collect();
-    table(o, &["step", "id", "digits", "type", "number"], &rows, 0);
+    if with_drop {
+        table(o, &["step", "id", "digits", "drop", "bits", "type", "number"], &rows, 0);
+        o.push_str("drop = digits (and bits) this step removed from the one before\n");
+    } else {
+        table(o, &["step", "id", "digits", "type", "number"], &rows, 0);
+    }
 }
 
 fn cert_stats_kv(v: &Value) -> Kv {
@@ -1368,7 +1416,7 @@ fn r_seq_view(o: &mut String, v: &Value) {
     }
     // Other sequences the start is a term of (index > 0) its own leg (index 0) is not news.
     if let Some(sq) = v.get("sequence_of") {
-        let others: Vec<Value> = arr(sq, "sequences").iter().filter(|m| u(m, "index") > 0).cloned().collect();
+        let others: Vec<Value> = arr(sq, "sequences").iter().filter(|m| u(m, "index") > 0 || b(m, "open_composite")).cloned().collect();
         if !others.is_empty() {
             o.push_str("\nthe start is also a term of\n");
             r_seq_of(o, &serde_json::json!({ "sequences": others }), 2);
@@ -1478,21 +1526,34 @@ fn r_seq_list(o: &mut String, v: &Value) {
     } else {
         table(o, &["start", "digits", "length", "end", "last term", "factorization", "composite digits", "driver"], &rows, 0);
     }
+    // a merged listing (--to) is paged by position: the next page starts after this one
+    if let Some(next) = v.get("next").and_then(Value::as_str).filter(|x| !x.is_empty()) {
+        let _ = writeln!(o, "(more sequences: --after {next})");
+    }
 }
 
 fn r_seq_of(o: &mut String, v: &Value, indent: usize) {
     // The membership lookup covers every sequence type: each entry carries its `type` code (an
     // older server sends none - those entries are aliquot). The type column shows the --type name.
+    // `open_composite`: the number is not a term but the composite holding up term `index`, the
+    // sequence's last (a factor of it advances the sequence) - then an extra column says which
+    let with_role = arr(v, "sequences").iter().any(|m| b(m, "open_composite"));
     let rows: Vec<Vec<String>> = arr(v, "sequences")
         .iter()
         .map(|m| {
             let start = if has(m, "start") { s(m, "start").to_string() } else { seq_base_exp(m, "start_id", "start_exp") };
             let kind = if has(m, "type") { crate::seq_type_label(u(m, "type")) } else { "aliquot".to_string() };
-            vec![kind, start, n(m, "index"), commas(u(m, "length")), end_str(m.get("end").unwrap_or(&Value::Null))]
+            let mut row = vec![kind, start, n(m, "index"), commas(u(m, "length")), end_str(m.get("end").unwrap_or(&Value::Null))];
+            if with_role {
+                row.push(if b(m, "open_composite") { "open composite of the last term".into() } else { "term".into() });
+            }
+            row
         })
         .collect();
     if rows.is_empty() {
         let _ = writeln!(o, "{}(not a term of any known sequence)", " ".repeat(indent));
+    } else if with_role {
+        table(o, &["type", "sequence start", "index", "length", "end", "as"], &rows, indent);
     } else {
         table(o, &["type", "sequence start", "index", "length", "end"], &rows, indent);
     }
@@ -1508,6 +1569,14 @@ fn stats_kv(v: &Value) -> Kv {
     kv.add("CF (partially factored)", commas(u(v, "cf")));
     kv.add("U (untested)", commas(u(v, "u")));
     kv.add("total", commas(u(v, "total")));
+    // sent with exact counts only: open sequences whose blocking composite is stored (a composite
+    // blocking two sequences counts twice); not part of the total
+    kv.add_if(has(v, "seq_ends"), "open sequence ends", commas(u(v, "seq_ends")));
+    kv.add(
+        "counts",
+        if has(v, "counted_at") { format!("exact, as of {} UTC", date_utc(i(v, "counted_at"))) } else { "estimates (InnoDB)".to_string() },
+    );
+    kv.add_if(has(v, "max_fid"), "newest id", format!("#{}", n(v, "max_fid")));
     kv.add("data", bytes_h(u(v, "data_bytes")));
     kv.add("indexes", bytes_h(u(v, "index_bytes")));
     let load: Vec<String> = arr(v, "load").iter().map(|x| format!("{:.2}", x.as_f64().unwrap_or(0.0))).collect();
@@ -1623,15 +1692,91 @@ fn r_status(o: &mut String, v: &Value) {
 }
 
 fn r_digit_dist(o: &mut String, v: &Value) {
+    digit_dist(o, v, false);
+}
+
+/// `digit-distribution`, with `noseq` the C column without the open ends of sequences.
+pub fn render_digit_dist(v: &Value, noseq: bool) -> String {
+    let mut o = String::new();
+    digit_dist(&mut o, v, noseq);
+    o
+}
+
+/// Counts per digit length; `seq ends` = open sequences whose blocking composite has that length
+/// (they are among the C). With `noseq` the C column leaves them out instead (as the site's digits
+/// page offers).
+fn digit_dist(o: &mut String, v: &Value, noseq: bool) {
     let rows: Vec<Vec<String>> = arr(v, "rows")
         .iter()
-        .map(|r| vec![n(r, "a"), commas_i(i(r, "p")), commas_i(i(r, "prp")), commas_i(i(r, "c")), commas_i(i(r, "cf")), commas_i(i(r, "u"))])
+        .map(|r| {
+            let c = i(r, "c");
+            let mut row = vec![n(r, "a"), commas_i(i(r, "p")), commas_i(i(r, "prp"))];
+            if noseq {
+                row.push(commas_i((c - i(r, "seq_ends")).max(0)));
+            } else {
+                row.push(commas_i(c));
+            }
+            row.push(commas_i(i(r, "cf")));
+            row.push(commas_i(i(r, "u")));
+            if !noseq {
+                row.push(commas_i(i(r, "seq_ends")));
+            }
+            row
+        })
         .collect();
     if rows.is_empty() {
         o.push_str("(no rows in this range)\n");
-    } else {
+    } else if noseq {
         table(o, &["digits", "P", "PRP", "C", "CF", "U"], &rows, 0);
+        o.push_str("C without the open ends of sequences (their blocking composites)\n");
+    } else {
+        table(o, &["digits", "P", "PRP", "C", "CF", "U", "seq ends"], &rows, 0);
+        o.push_str("seq ends = open sequences whose blocking composite has that length (counted in C too)\n");
     }
+}
+
+/// The distinct lowercase variable letters of a family formula, in order (function words skipped).
+fn family_letters(expr: &str) -> Vec<u8> {
+    let b = expr.as_bytes();
+    let (mut out, mut i) = (Vec::new(), 0);
+    while i < b.len() {
+        if let Some(len) = family_word_at(b, i) {
+            i += len;
+            continue;
+        }
+        if b[i].is_ascii_lowercase() && !out.contains(&b[i]) {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A factor-table row's frontier: its first member that is not fully factored, as the site's tables
+/// page writes it - the varying variable's value and what is open ("n = 155 (C76 left, +1 more)").
+fn frontier_text(e: &Value) -> String {
+    let Some(f) = e.get("frontier").filter(|f| !f.is_null()) else {
+        return "-".into();
+    };
+    // the varying variable: `v` of the row's parm, else n, else x, else the first letter
+    let vars = family_letters(s(e, "formula"));
+    let parm_v = s(e, "parm").trim_start_matches('&').split('&').find_map(|kv| kv.strip_prefix("v=")).unwrap_or("");
+    let vary = match parm_v.as_bytes() {
+        [c] if vars.contains(c) => *c as char,
+        _ if vars.contains(&b'n') => 'n',
+        _ if vars.contains(&b'x') => 'x',
+        _ => vars.first().map(|c| *c as char).unwrap_or('n'),
+    };
+    let od = commas(u(f, "open_digits"));
+    let what = match s(f, "kind") {
+        "C" => format!("C{od}"),
+        "CF" => format!("C{od} left"),
+        "U" => format!("U{od}"),
+        _ => format!("{od} digits, not stored"),
+    };
+    let more = u(f, "open_count").saturating_sub(1);
+    let more = if more > 0 { format!(", +{more} more") } else { String::new() };
+    format!("{vary} = {} ({what}{more})", s(f, "n"))
 }
 
 fn r_factor_tables(o: &mut String, v: &Value) {
@@ -1639,14 +1784,38 @@ fn r_factor_tables(o: &mut String, v: &Value) {
     if cats.is_empty() {
         o.push_str("(no factor tables)\n");
     }
+    // frontier: the first member of the row's default values that is not fully factored (C = no
+    // factor known, C.. left = a composite part left, U = untested), refreshed in the background
+    if let Some(ts) = v.get("frontier_checked").and_then(Value::as_i64) {
+        let _ = writeln!(o, "frontier = first member not fully factored, checked {} UTC\n", date_utc(ts));
+    }
     for (idx, c) in cats.iter().enumerate() {
         if idx > 0 {
             o.push('\n');
         }
         let _ = writeln!(o, "[{}] {}", u(c, "id"), s(c, "name"));
-        let rows: Vec<Vec<String>> = arr(c, "entries").iter().map(|e| vec![s(e, "name").to_string(), s(e, "formula").to_string()]).collect();
-        if !rows.is_empty() {
-            table(o, &["name", "formula"], &rows, 2);
+        let entries = arr(c, "entries");
+        let with_parm = entries.iter().any(|e| !s(e, "parm").is_empty());
+        let rows: Vec<Vec<String>> = entries
+            .iter()
+            .map(|e| {
+                let dash = |t: &str| if t.is_empty() { "-".to_string() } else { t.to_string() };
+                let mut row = vec![s(e, "name").to_string(), s(e, "formula").to_string()];
+                if with_parm {
+                    row.push(dash(s(e, "parm")));
+                }
+                row.push(dash(&s(e, "oeis").replace(',', ", ")));
+                row.push(frontier_text(e));
+                row
+            })
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        if with_parm {
+            table(o, &["name", "formula", "parm", "oeis", "frontier"], &rows, 2);
+        } else {
+            table(o, &["name", "formula", "oeis", "frontier"], &rows, 2);
         }
     }
 }
@@ -1696,19 +1865,25 @@ fn r_prp_candidates(o: &mut String, v: &Value) {
     }
 }
 
+/// A rational side `g = y1*x + y0` on one line ("g = x - 10000").
+fn rational_side_text(y1: &str, y0: &str) -> String {
+    let tail = match y0.strip_prefix('-') {
+        Some(m) => format!("- {m}"),
+        None => format!("+ {y0}"),
+    };
+    if y1 == "1" { format!("g = x {tail}") } else { format!("g = {y1}*x {tail}") }
+}
+
 /// The numbers on one shared SNFS side, cheapest own side first.
 fn r_snfs_side_numbers(o: &mut String, v: &Value) {
     let side = if s(v, "side") == "algebraic" {
         let c: Vec<&str> = arr(v, "c").iter().filter_map(Value::as_str).collect();
         format!("algebraic, f = {}", crate::snfs::poly_text(&c))
     } else {
-        let (y1, y0) = (s(v, "y1"), s(v, "y0"));
-        let tail = match y0.strip_prefix('-') {
-            Some(m) => format!("- {m}"),
-            None => format!("+ {y0}"),
-        };
-        if y1 == "1" { format!("rational, g = x {tail}") } else { format!("rational, g = {y1}*x {tail}") }
+        format!("rational, {}", rational_side_text(s(v, "y1"), s(v, "y0")))
     };
+    // `store_cost` (with --skew): the own side's digits at the store's skew, which then ranks the list
+    let at_skew = arr(v, "numbers").iter().any(|x| has(x, "store_cost"));
     let _ = writeln!(o, "side     {side}");
     let _ = writeln!(o, "numbers  {} in the index", commas(u(v, "total")));
     let rows: Vec<Vec<String>> = arr(v, "numbers")
@@ -1719,28 +1894,184 @@ fn r_snfs_side_numbers(o: &mut String, v: &Value) {
                 (st, _) => st.to_string(),
             };
             let num = |k: &str| n.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-            vec![
+            let mut row = vec![
                 fid_label(n, "id"),
                 commas(u(n, "digits")),
                 state,
                 u(n, "degree").to_string(),
                 format!("{:.1}", num("difficulty")),
                 format!("{:.1}", num("cost")),
-                number_text(n),
-            ]
+            ];
+            if at_skew {
+                row.push(if has(n, "store_cost") { format!("{:.1}", num("store_cost")) } else { "-".into() });
+            }
+            row.push(number_text(n));
+            row
         })
         .collect();
     if rows.is_empty() {
         o.push_str("(no open number of the factor tables on this side)\n");
     } else {
-        table(o, &["id", "digits", "state", "deg", "difficulty", "own side", "number"], &rows, 0);
+        if at_skew {
+            table(o, &["id", "digits", "state", "deg", "difficulty", "own side", "at skew", "number"], &rows, 0);
+        } else {
+            table(o, &["id", "digits", "state", "deg", "difficulty", "own side", "number"], &rows, 0);
+        }
         o.push_str("own side = digits of the norm of each number's other side (the one not shared) at |a|, |b| about 10^9\n");
+        if at_skew {
+            o.push_str("at skew = the same at the skew given (--skew), which ranks the list\n");
+        }
     }
     if b(v, "cut") {
         o.push_str("(this page ran out of time)\n");
     }
     if let Some(next) = v.get("next").and_then(Value::as_u64) {
         let _ = writeln!(o, "(more numbers: --offset {next})");
+    }
+}
+
+/// The numbers that share one side of a number's best SNFS polynomial (co-sieving candidates).
+fn r_snfs_siblings(o: &mut String, v: &Value) {
+    if !has(v, "form") {
+        o.push_str("no SNFS polynomial (no known special form)\n");
+        return;
+    }
+    let algebraic = s(v, "side") == "algebraic";
+    let side = if algebraic {
+        let c: Vec<&str> = arr(v, "c").iter().filter_map(Value::as_str).collect();
+        format!("algebraic, f = {}", crate::snfs::poly_text(&c))
+    } else {
+        format!("rational, {}", rational_side_text(s(v, "y1"), s(v, "y0")))
+    };
+    let mut kv = Kv::new();
+    kv.add("form", s(v, "form"));
+    kv.add("degree", n(v, "degree"));
+    kv.add("shared side", side);
+    kv.write(o, 0);
+    let sibs = arr(v, "siblings");
+    if sibs.is_empty() {
+        o.push_str("(no number found that shares this side)\n");
+    } else {
+        let num = |m: &Value, k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let rows: Vec<Vec<String>> = sibs
+            .iter()
+            .map(|m| {
+                let state = match (s(m, "status"), m.get("open_digits").and_then(Value::as_u64)) {
+                    ("", _) => "not stored".to_string(),
+                    (st @ ("CF" | "C" | "U"), Some(d)) if d < u(m, "digits") => format!("{st}, open {}", commas(d)),
+                    (st, _) => st.to_string(),
+                };
+                // the pair's place in the member's own list (0 = its best) and its Murphy E over the best one's
+                let rank = if u(m, "rank") == 0 { "best".to_string() } else { format!("#{}", u(m, "rank")) };
+                let own_best = if has(m, "best_degree") {
+                    format!("deg {}, {:.1}", u(m, "best_degree"), num(m, "best_difficulty"))
+                } else {
+                    "-".to_string()
+                };
+                let term = if s(m, "term").is_empty() { "-".to_string() } else { truncate(s(m, "term"), 60).trim_end().to_string() };
+                vec![
+                    fid_label(m, "id"),
+                    commas(u(m, "digits")),
+                    state,
+                    format!("{:.1}", num(m, "difficulty")),
+                    rank,
+                    format!("{:.3}", num(m, "relative_e")),
+                    own_best,
+                    term,
+                ]
+            })
+            .collect();
+        o.push('\n');
+        table(o, &["id", "digits", "state", "difficulty", "rank", "rel. E", "own best", "term"], &rows, 0);
+        o.push_str(
+            "rank = place of the shared pair in the number's own list (best = its best polynomial); rel. E = its Murphy E\n\
+             over that of the number's best; own best = degree and difficulty of that best when it is another pair\n",
+        );
+    }
+    if let Some(t) = v.get("total").and_then(Value::as_u64) {
+        let _ = writeln!(o, "({} numbers share this side in all, {} listed)", commas(t), sibs.len());
+    }
+    if b(v, "cut") {
+        o.push_str("(the search ran out of time; more numbers may share this side)\n");
+    }
+}
+
+/// The recorded finds of prime factors (ecmfac), as the number page's ECM box shows them.
+fn r_ecm_finds(o: &mut String, v: &Value) {
+    let rows: Vec<Vec<String>> = arr(v, "finds")
+        .iter()
+        .map(|f| {
+            let t = i(f, "type");
+            // sigma as GMP-ECM writes it for params 1-3 (P:S); none for P-1 / P+1
+            let sg = n(f, "sigma");
+            let sigma = match t {
+                2 | 3 => "-".to_string(),
+                _ if sg == "-" || sg == "0" => "-".to_string(),
+                5..=7 => format!("{}:{sg}", t - 4),
+                _ => sg,
+            };
+            let b2 = if u(f, "b2") == 0 { "-".to_string() } else { n(f, "b2") };
+            let who = if u(f, "uid") == 0 || s(f, "submitter").is_empty() { "-".to_string() } else { s(f, "submitter").to_string() };
+            let order = match f.get("order") {
+                Some(ord) if u(ord, "fid") > 0 && u(ord, "digits") > 0 => format!("{} ({})", number_text(ord), fid_label(ord, "fid")),
+                _ => "-".to_string(),
+            };
+            vec![fid_label(f, "fid"), ecm_type_name(t).to_string(), n(f, "b1"), b2, sigma, date_utc(i(f, "ts")), who, order]
+        })
+        .collect();
+    if rows.is_empty() {
+        o.push_str("(no recorded finds)\n");
+    } else {
+        table(o, &["factor", "method", "B1", "B2", "sigma", "reported", "by", "order"], &rows, 0);
+        o.push_str("order = the group order of the curve (ECM), p-1 (P-1) or p+1 (P+1) as recorded\n");
+    }
+}
+
+fn r_report_ecm(o: &mut String, v: &Value) {
+    let mut kv = Kv::new();
+    if b(v, "ok") {
+        kv.add("result", format!("recorded: {}", ecm_type_name(i(v, "type"))));
+        kv.add_if(has(v, "order_fid"), "order stored", fid_label(v, "order_fid"));
+    } else {
+        kv.add("result", "not recorded");
+        kv.add("reason", s(v, "error"));
+        kv.add_if(has(v, "order"), "order", s(v, "order"));
+    }
+    kv.write(o, 0);
+}
+
+/// The background proof / PRP-test queue (`fdb call worker_queue '{"offset":0,"limit":100}'`).
+fn r_worker_queue(o: &mut String, v: &Value) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let since = |ts: u64| if ts > 0 { ago(now.saturating_sub(ts)) } else { "-".to_string() };
+    let kind = |e: &Value| if s(e, "kind") == "proof" { "primality proof" } else { "PRP test" };
+    let label = |e: &Value| if s(e, "term").is_empty() && s(e, "preview").is_empty() { fid_label(e, "fid") } else { number_text(e) };
+    let running: Vec<Vec<String>> = arr(v, "running")
+        .iter()
+        .map(|e| vec![fid_label(e, "fid"), kind(e).to_string(), commas(u(e, "digits")), since(u(e, "started")), str_of(e, "host"), label(e)])
+        .collect();
+    o.push_str("being worked on\n");
+    if running.is_empty() {
+        o.push_str("  (none)\n");
+    } else {
+        table(o, &["id", "kind", "digits", "started", "host", "number"], &running, 2);
+    }
+    let total = u(v, "waiting_total");
+    let waiting = arr(v, "waiting");
+    let offset = u(v, "offset");
+    let _ = writeln!(o, "\nwaiting  {} in all", commas(total));
+    if !waiting.is_empty() {
+        let rows: Vec<Vec<String>> = waiting
+            .iter()
+            .map(|e| vec![n(e, "pos"), fid_label(e, "fid"), kind(e).to_string(), commas(u(e, "digits")), since(u(e, "queued")), label(e)])
+            .collect();
+        table(o, &["pos", "id", "kind", "digits", "queued", "number"], &rows, 2);
+        let next = offset + waiting.len() as u64;
+        if next < total {
+            let _ = writeln!(o, "(more waiting: offset {next})");
+        }
+    } else if total > 0 {
+        let _ = writeln!(o, "(nothing at offset {offset})");
     }
 }
 
@@ -1835,6 +2166,15 @@ fn r_session(o: &mut String, v: &Value) {
     kv.add("permissions", perm_desc(u(v, "perm")));
     kv.add_if(has(v, "token"), "token", s(v, "token"));
     kv.write(o, 0);
+}
+
+fn r_change_password(o: &mut String, v: &Value) {
+    if b(v, "ok") {
+        o.push_str("password changed (the API token stays valid)\n");
+    } else {
+        let e = s(v, "error");
+        let _ = writeln!(o, "password not changed{}", if e.is_empty() { String::new() } else { format!(": {e}") });
+    }
 }
 
 fn r_whoami(o: &mut String, v: &Value) {

@@ -98,6 +98,18 @@ fn parse_big_int(s: &str) -> std::result::Result<String, String> {
     })
 }
 
+/// A stored id given as `N`, `id:N`, `fid:N` or `#N`.
+fn parse_fid(s: &str) -> std::result::Result<u64, String> {
+    let t = s.trim();
+    if let Ok(n) = t.parse::<u64>() {
+        return Ok(n);
+    }
+    match target(t) {
+        Ok(v) => v.get("id").and_then(Value::as_u64).ok_or_else(|| format!("'{s}' is not an id (N, id:N or #N)")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     // ---- Numbers & factors ----
@@ -210,6 +222,29 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Record how a prime factor of 25 to 100 digits was found (ECM, P-1 or P+1 and the bounds; checked
+    /// against the group order first) [report_ecm]
+    ReportEcm {
+        /// The prime factor: its stored id (N, id:N or #N)
+        #[arg(value_parser = parse_fid)]
+        id: u64,
+        /// ecm (a GMP-ECM curve, see --param), edwards (the old site's Edwards curves), pm1 (P-1) or pp1 (P+1)
+        #[arg(long, value_parser = ["ecm", "edwards", "pm1", "pp1"])]
+        method: String,
+        /// GMP-ECM parametrization for --method ecm: 0 = Suyama, 1 = GMP-ECM default, 2, 3 (a sigma
+        /// written P:S, as GMP-ECM prints it, sets it too)
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3), value_name = "0-3")]
+        param: u8,
+        /// The curve's sigma, for ecm and edwards
+        #[arg(long)]
+        sigma: Option<String>,
+        /// The stage 1 bound
+        #[arg(long, value_name = "B1")]
+        b1: String,
+        /// The stage 2 bound (default: no stage 2)
+        #[arg(long, value_name = "B2")]
+        b2: Option<String>,
+    },
 
     // ---- Primality proofs ----
     /// Run a special-form proof (Pocklington N-1 / Morrison N+1 / combined); large numbers queue [prove]
@@ -241,6 +276,15 @@ enum Cmd {
         /// Write to FILE instead of stdout
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
+    },
+    /// Numbers that share the rational side (or the algebraic side) of a number's best SNFS polynomial,
+    /// so one sieve can serve them together [snfs_siblings]
+    SnfsSiblings {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// The numbers that share the algebraic side f instead of the rational side
+        #[arg(long)]
+        algebraic: bool,
     },
     /// Which numbers can my SNFS side factor? For the factorization factory: the numbers of the factor
     /// tables with an SNFS polynomial on one shared side - a rational side (--m, or --y0 with --y1; the
@@ -274,6 +318,13 @@ enum Cmd {
         /// Also numbers fully factored or prime by now (the index drops them weekly)
         #[arg(long)]
         all: bool,
+        /// The skew your store was sieved at: each number's own side is measured there (the "at skew"
+        /// column), and the list is ranked by it
+        #[arg(long, value_name = "S")]
+        skew: Option<f64>,
+        /// Leave out numbers whose own side (at --skew when given) has more digits than this
+        #[arg(long, value_name = "D")]
+        max_cost: Option<f64>,
         /// Position in the list to start from (the "--offset N" the previous page names)
         #[arg(long, default_value_t = 0)]
         offset: u64,
@@ -351,6 +402,9 @@ enum Cmd {
         /// How many digit lengths
         #[arg(long, default_value_t = 100)]
         count: u64,
+        /// Leave the open ends of sequences out of the C column (C minus the seq ends column)
+        #[arg(long)]
+        noseq: bool,
     },
     /// The factor-table catalogue (backs the Tables page) [factor_tables]
     FactorTables,
@@ -402,6 +456,12 @@ enum Cmd {
         #[arg(long)]
         show_special: bool,
     },
+    /// How prime factors were found, as recorded: ECM curve, P-1 or P+1, bounds, sigma, group order [ecm_finds]
+    EcmFinds {
+        /// Stored ids of prime factors (N, id:N or #N; at most 200)
+        #[arg(required = true, value_name = "ID", value_parser = parse_fid)]
+        ids: Vec<u64>,
+    },
 
     // ---- Tools & downloads ----
     /// Elliptic-curve group order #E(F_p) for a GMP-ECM (param, sigma) over a prime [ecm_group_order]
@@ -432,6 +492,9 @@ enum Cmd {
         /// Each number as its full stored term (a cofactor as (parent)/known factors) instead of the export format
         #[arg(long)]
         terms: bool,
+        /// Only regular numbers: leave out the open ends of sequences and read on past them
+        #[arg(long)]
+        regular: bool,
         /// Write the numbers to FILE instead of stdout
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
@@ -486,6 +549,9 @@ enum Cmd {
         #[arg(long)]
         no_save: bool,
     },
+    /// Change your account's password; prompts for the current and the new one (the API token stays
+    /// valid) [change_password]
+    ChangePassword,
     /// Invalidate the current API token and forget it [logout]
     Logout,
     /// Your resource usage against the per-client limits [quota_status]
@@ -675,6 +741,9 @@ enum SeqCmd {
         /// 10^66, written 10^6, 1e6 or 1000000); replaces --category and --offset
         #[arg(long, value_name = "BOUND", value_parser = parse_start_bound, conflicts_with_all = ["category", "offset"])]
         to: Option<u8>,
+        /// With --to: continue just after this position (the "--after POS" the previous page names)
+        #[arg(long, value_name = "POS", requires = "to")]
+        after: Option<String>,
     },
     /// Which sequences a number is a term of [sequence_of]
     Of {
@@ -1026,6 +1095,35 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             ctx.simple_long("report_factors", p)
         }
         Cmd::ReportFile { file, credit, batch, from_line, dry_run } => run_report_file(&ctx, &file, credit, batch, from_line, dry_run),
+        Cmd::ReportEcm { id, method, param, sigma, b1, b2 } => {
+            let mut param = param;
+            let mut sigma = sigma.unwrap_or_default().trim().to_string();
+            // GMP-ECM prints the curve as PARAM:SIGMA (e.g. 1:2938471): the prefix sets the param
+            if method == "ecm" {
+                if let Some((pre, rest)) = sigma.split_once(':') {
+                    if let (Ok(p @ 0..=3), true) = (pre.trim().parse::<u8>(), !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())) {
+                        param = p;
+                        sigma = rest.to_string();
+                    }
+                }
+            }
+            // the find is credited to the token's account: a stale token would record it anonymously
+            if ctx.client.token().is_some_and(|t| !t.is_empty()) {
+                let who = ctx.verify_token("report-ecm")?;
+                if !ctx.json {
+                    eprintln!("reporting as {}", who.get("login").and_then(Value::as_str).unwrap_or("?"));
+                }
+            } else {
+                eprintln!("no API token configured: the find is recorded anonymously");
+            }
+            let p = json!({ "id": id, "method": method, "param": param, "sigma": sigma, "b1": b1.trim(), "b2": b2.unwrap_or_default().trim() });
+            let v = ctx.client.call_long("report_ecm", p)?;
+            ctx.print("report_ecm", &v);
+            if !v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                return Err(Error::Failed("find not recorded".into()));
+            }
+            Ok(())
+        }
 
         // ---- proofs ----
         Cmd::Prove { target: t } => ctx.simple_long("prove", json!({ "target": target(&t)? })),
@@ -1037,7 +1135,13 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             ctx.simple_long("check_factors", p)
         }
         Cmd::Snfs { target: t, format, poly, output } => {
-            let v = ctx.client.call("snfs_poly", json!({ "target": target(&t)? }))?;
+            let mut params = json!({ "target": target(&t)? });
+            // the ggnfs and cado files carry the sieving parameters of factordb's model (up to about a
+            // second per polynomial on the server, so only for them; the list and msieve's .fb need none)
+            if matches!(format, SnfsFormat::Ggnfs | SnfsFormat::Cado) {
+                params["params"] = json!(true);
+            }
+            let v = ctx.client.call("snfs_poly", params)?;
             let polys = v.get("polys").and_then(Value::as_array).cloned().unwrap_or_default();
             if polys.is_empty() && !ctx.json {
                 return Err(Error::Failed("no SNFS polynomial for this number (it has no known special form)".into()));
@@ -1084,7 +1188,19 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::SnfsSide { m, y0, y1, f, min_digits, max_digits, min_degree, max_degree, all, offset, limit } => {
+        Cmd::SnfsSiblings { target: t, algebraic } => {
+            let mut p = json!({ "target": target(&t)? });
+            if algebraic {
+                p["side"] = json!("algebraic");
+            }
+            let v = ctx.client.call("snfs_siblings", p)?;
+            if !ctx.json && v.get("form").is_none() {
+                return Err(Error::Failed("no SNFS polynomial for this number (it has no known special form)".into()));
+            }
+            ctx.print("snfs_siblings", &v);
+            Ok(())
+        }
+        Cmd::SnfsSide { m, y0, y1, f, min_digits, max_digits, min_degree, max_degree, all, skew, max_cost, offset, limit } => {
             let mut p = json!({ "offset": offset, "limit": limit });
             match (m, y0, f) {
                 (Some(m), None, None) => p["m"] = json!(m),
@@ -1104,6 +1220,14 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             }
             if all {
                 p["all"] = json!(true);
+            }
+            for (k, v) in [("skew", skew), ("max_cost", max_cost)] {
+                if let Some(v) = v {
+                    if !v.is_finite() {
+                        return Err(Error::Usage(format!("--{}: '{v}' is not a number", k.replace('_', "-"))));
+                    }
+                    p[k] = json!(v);
+                }
             }
             ctx.simple("snfs_side_numbers", p)
         }
@@ -1149,7 +1273,15 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
         Cmd::Stats => ctx.simple("stats", json!({})),
         Cmd::Smallest => ctx.simple("smallest", json!({})),
         Cmd::CombProgress => ctx.simple("comb_progress", json!({})),
-        Cmd::DigitDistribution { start, count } => ctx.simple("digit_distribution", json!({ "start": start, "count": count })),
+        Cmd::DigitDistribution { start, count, noseq } => {
+            let v = ctx.client.call("digit_distribution", json!({ "start": start, "count": count }))?;
+            if ctx.json {
+                ctx.print_json(&v);
+            } else {
+                print!("{}", render::render_digit_dist(&v, noseq));
+            }
+            Ok(())
+        }
         Cmd::FactorTables => ctx.simple("factor_tables", json!({})),
         Cmd::List { table, min_digits, offset, limit, sort, max_digits, all, max_pct } => {
             let table = table_name(&table, &["P", "PRP", "C", "U", "CF"])?;
@@ -1180,6 +1312,35 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             "ecm_list",
             json!({ "type_id": type_id, "min_digits": min_digits, "by_time": by_time, "descending": descending, "skip": skip, "limit": limit, "include_special": show_special }),
         ),
+        Cmd::EcmFinds { ids } => {
+            if ids.len() > 200 {
+                return Err(Error::Usage(format!("at most 200 ids, got {}", ids.len())));
+            }
+            let v = ctx.client.call("ecm_finds", json!({ "ids": ids }))?;
+            let found: Vec<u64> = v
+                .get("finds")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|f| f.get("fid").and_then(|x| x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_u64()))).collect())
+                .unwrap_or_default();
+            let mut missing: Vec<String> = Vec::new();
+            for id in &ids {
+                let label = format!("#{id}");
+                if !found.contains(id) && !missing.contains(&label) {
+                    missing.push(label);
+                }
+            }
+            if found.is_empty() {
+                if ctx.json {
+                    ctx.print_json(&v);
+                }
+                return Err(Error::Failed(format!("no ECM / P-1 / P+1 find recorded for {}", missing.join(", "))));
+            }
+            ctx.print("ecm_finds", &v);
+            if !missing.is_empty() {
+                ctx.status(format!("no find recorded for {}", missing.join(", ")));
+            }
+            Ok(())
+        }
 
         // ---- tools ----
         Cmd::EcmGroupOrder { number, sigma, param } => {
@@ -1190,7 +1351,7 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Download { table, digits, count, random, terms, output } => {
+        Cmd::Download { table, digits, count, random, terms, regular, output } => {
             let table = table_name(&table, &["C", "CF", "PRP", "U", "P"])?;
             if count == 0 || count > 50_000 {
                 return Err(Error::Usage(format!("--count must be between 1 and 50000, got {count}")));
@@ -1199,7 +1360,15 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             if terms {
                 p["terms"] = json!(true);
             }
+            if regular {
+                p["regular"] = json!(true);
+            }
             let v = ctx.client.call("download", p)?;
+            // with --regular: how many open sequence ends were left out (stderr, the numbers stay clean)
+            let skipped = match v.get("skipped").and_then(Value::as_u64) {
+                Some(k) if regular => format!(", {k} open sequence end{} left out", if k == 1 { "" } else { "s" }),
+                _ => String::new(),
+            };
             match output {
                 Some(path) => {
                     let mut text = if ctx.json { render::pretty(&v) } else { render::render("download", &v) };
@@ -1207,9 +1376,14 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
                         text.push('\n');
                     }
                     std::fs::write(&path, text)?;
-                    ctx.status(format!("{} numbers written to {}", v.get("count").and_then(Value::as_u64).unwrap_or(0), path.display()));
+                    ctx.status(format!("{} numbers written to {}{skipped}", v.get("count").and_then(Value::as_u64).unwrap_or(0), path.display()));
                 }
-                None => ctx.print("download", &v),
+                None => {
+                    ctx.print("download", &v);
+                    if !ctx.json && !skipped.is_empty() {
+                        eprintln!("{} numbers{skipped}", v.get("count").and_then(Value::as_u64).unwrap_or(0));
+                    }
+                }
             }
             Ok(())
         }
@@ -1312,6 +1486,33 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
                 return Err(Error::Failed("token regeneration failed".into()));
             }
             finish_session(&mut ctx, "regenerate_token", &v, no_save, true)
+        }
+        Cmd::ChangePassword => {
+            // the account is the token's: check it before asking for any password
+            ctx.verify_token("change-password")?;
+            let old = prompt_password("Current password: ")?;
+            let new = prompt_password("New password: ")?;
+            if std::io::stdin().is_terminal() {
+                let again = prompt_password("Repeat new password: ")?;
+                if new != again {
+                    return Err(Error::Usage("the new passwords do not match".into()));
+                }
+            }
+            let v = ctx.client.call("change_password", json!({ "old": old, "new": new }))?;
+            let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            if ok || ctx.json {
+                ctx.print("change_password", &v);
+            }
+            if !ok {
+                // a wrong current password counts like a failed login: several make the next try wait
+                let wait = match v.get("retry_after").and_then(Value::as_u64) {
+                    Some(w) if w > 0 => format!(" - try again in {w} s"),
+                    _ => String::new(),
+                };
+                let why = v.get("error").and_then(Value::as_str).unwrap_or("rejected");
+                return Err(Error::Failed(format!("password not changed: {why}{wait}")));
+            }
+            Ok(())
         }
         Cmd::Logout => {
             let tok = ctx.token_required("logout")?;
@@ -1604,12 +1805,16 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             let start = resolve_start(ctx, &start)?;
             ctx.simple_long("extend_sequence", json!({ "start": start, "steps": steps, "type": kind }))
         }
-        SeqCmd::List { limit, offset, kind, category, end, sort, dir, driver, guide, to } => {
+        SeqCmd::List { limit, offset, kind, category, end, sort, dir, driver, guide, to, after } => {
             let mut p = match to {
                 // the server merges the start categories 0..=max_category (category n = up to 10^(n+3))
                 Some(max_category) => json!({ "limit": limit, "type": kind, "all": true, "max_category": max_category }),
                 None => json!({ "limit": limit, "offset": offset, "type": kind, "category": category }),
             };
+            // the next page of a merged listing: the `next` position of the previous one
+            if let Some(a) = after.map(|a| a.trim().to_string()).filter(|a| !a.is_empty()) {
+                p["after"] = Value::String(a);
+            }
             if let Some(g) = guide {
                 p["guide"] = json!(g);
             }
@@ -2189,15 +2394,15 @@ fn print_seq_types() {
 
 /// Command groups in display order; every visible subcommand must appear here (checked in tests).
 const GROUPS: &[(&str, &[&str])] = &[
-    ("Numbers & factors", &["id", "number", "factors", "factor-of", "nextprime", "prevprime", "primality", "algebraic", "family", "report", "report-file"]),
+    ("Numbers & factors", &["id", "number", "factors", "factor-of", "nextprime", "prevprime", "primality", "algebraic", "family", "report", "report-file", "report-ecm"]),
     ("Primality proofs", &["prove", "proof-progress", "proof-state", "proof-list"]),
-    ("Factoring", &["check-factors", "snfs", "snfs-side"]),
+    ("Factoring", &["check-factors", "snfs", "snfs-siblings", "snfs-side"]),
     ("Probable-prime tests", &["prp-test", "prp-test-info"]),
     ("Certificates", &["cert"]),
     ("Sequences", &["seq"]),
-    ("Statistics & listings", &["status", "stats", "smallest", "comb-progress", "digit-distribution", "factor-tables", "list", "ecm-list"]),
+    ("Statistics & listings", &["status", "stats", "smallest", "comb-progress", "digit-distribution", "factor-tables", "list", "ecm-list", "ecm-finds"]),
     ("Tools & downloads", &["ecm-group-order", "download", "primo-batch"]),
-    ("Account", &["login", "register", "whoami", "regenerate-token", "logout", "quota", "contributions"]),
+    ("Account", &["login", "register", "whoami", "regenerate-token", "change-password", "logout", "quota", "contributions"]),
     ("Utility", &["health", "call", "batch", "config"]),
 ];
 

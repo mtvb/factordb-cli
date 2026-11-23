@@ -38,9 +38,9 @@ carried that same token); otherwise the new token is printed and the file is lef
 always prints instead of saving. `logout` invalidates the token and removes it from the file.
 
 **Timeouts.** `--timeout SECS` applies to every call (0 = none). Without it, read calls give up
-after 120 s while write calls (`report`, `report-file`, `prove`, `check-factors`, `prp-test`,
-`proof-progress`, `seq extend`, `seq view`, `seq advance`, `cert upload`, `id --create`, `call`,
-`batch`) wait for the server, which finishes the work either way. A saved `timeout` in the config
+after 120 s while write calls (`report`, `report-file`, `report-ecm`, `prove`, `check-factors`, `prp-test`,
+`proof-progress`, `seq extend`, `seq view`, `seq advance`, `cert upload`, `change-password`,
+`id --create`, `call`, `batch`) wait for the server, which finishes the work either way. A saved `timeout` in the config
 file is validated: only finite values from 0 up.
 
 ## Addressing numbers
@@ -88,7 +88,9 @@ prime, one copy of the least prime dropped) and `mdc<b>` (mid-divisor concatenat
 | `proof-state <TARGET> [--wait [--interval S]]` | proof_state | `--wait` polls until dequeued, every `--interval` seconds (default 5) |
 | `proof-list [--type 0..3] [--min-digits] [--descending] [--skip] [--limit]` | proof_list | |
 | `check-factors <TARGET> [--dry-run]` | check_factors | write; runs the next bounded P-1 / P+1 / ECM step on a stored composite of at most 300 digits and reports a factor it finds; `--dry-run` only shows the level and the next step |
-| `snfs <TARGET> [--format list\|ggnfs\|msieve\|cado] [--poly I] [-o FILE]` | snfs_poly | SNFS polynomials for a special-form composite: the list, best first, or polynomial `--poly` as a GGNFS / yafu job file, msieve `.fb` or CADO-NFS `.poly` with sieving parameters |
+| `snfs <TARGET> [--format list\|ggnfs\|msieve\|cado] [--poly I] [-o FILE]` | snfs_poly | SNFS polynomials for a special-form composite: the list, best first, or polynomial `--poly` as a GGNFS / yafu job file, msieve `.fb` or CADO-NFS `.poly` with sieving parameters - up to difficulty 210 from factordb's model of the whole sieving (as on the website), above that from yafu's table |
+| `snfs-side (--m M \| --y0 Y0 [--y1 Y1] \| --f C0,..,CD) [--min-digits] [--max-digits] [--min-degree] [--max-degree] [--skew S] [--max-cost D] [--all] [--offset] [--limit]` | snfs_side_numbers | the numbers with an SNFS polynomial on this rational (`--m`, `--y0`) or algebraic (`--f`) side, cheapest own side first; `--skew` measures each number's own side at the skew your store was sieved at, `--max-cost` leaves out numbers whose own side has more digits |
+| `snfs-siblings <TARGET> [--algebraic]` | snfs_siblings | the numbers of the same family that share the best polynomial's rational side (or, with `--algebraic`, its algebraic side): co-sieving candidates |
 | `prp-test <TARGET>` | prp_test | write |
 | `prp-test-info <TARGET>` | prp_test_info | |
 | `cert get <TARGET> [-o FILE]` | get_certificate | the stored bytes, exactly, to stdout (metadata on stderr) or to FILE |
@@ -103,25 +105,28 @@ prime, one copy of the least prime dropped) and `mdc<b>` (mid-divisor concatenat
 | `seq view <START> [--part all\|last\|last20\|range] [--fr N] [--to N] [--type T] [--check]` | sequence_view | write (advances the frontier first); `--to` ends a `range` (inclusive); `--check` also runs the next check-factors step on the last term's composite and shows the sequence again when it found a factor |
 | `seq extend <START> [--steps N] [--type T]` | extend_sequence | write |
 | `seq advance <START> [--type T] [--threads N] [--from L] [--to L] [--terms N] [--max-digits D] [--ecm PATH] [--heartbeat S] [--no-submit] [--credit]` | sequence_view + report_factors | alias `work`; factors the open frontier locally with gmp-ecm over the t20..t65 ladder and reports each factor (write); `--credit` as in `report` |
-| `seq list [--limit] [--offset] [--type] [--category] [--end KIND] [--sort] [--dir] [--driver CODE] [--guide V]` | list_sequences | `--guide` filters on the frontier's exact guide value (finer than `--driver`) |
+| `seq list [--limit] [--offset] [--type] [--category] [--end KIND] [--sort] [--dir] [--driver CODE] [--guide V] [--to BOUND [--after POS]]` | list_sequences | `--guide` filters on the frontier's exact guide value (finer than `--driver`); `--to 10^k` lists every start up to that power of ten, `--after` continues with the next page |
 | `seq of <TARGET>` | sequence_of | |
 | `seq types` | the `--type` codes and names (aliquot and its variants, hp2..hp36, ihp2..ihp36, lpf, climb2..climb36, sigma-1, phi+1, cototient, dhp/dihp/schp/mdc on bases 2, 3, 8, 10, 16) |
 | `status` | status | the whole status page |
 | `stats` | stats | |
 | `smallest` | smallest | |
 | `comb-progress` | comb_progress | |
-| `digit-distribution [--start] [--count]` | digit_distribution | stored numbers begin at 19 digits |
+| `digit-distribution [--start] [--count] [--noseq]` | digit_distribution | stored numbers begin at 19 digits; with a column of the open sequence ends per size, `--noseq` leaves them out of C |
 | `factor-tables` | factor_tables | |
 | `list <TABLE> [--min-digits] [--offset] [--limit]` | list_by_type | P, PRP, C, U, CF |
 | `ecm-list [--type 0..4] [--min-digits] [--by-time] [--descending] [--skip] [--limit] [--show-special]` | ecm_list | `--show-special` also lists the special-form finds (2^x-1, k*b^n+d, b^n+1, ...) |
 | `ecm-group-order <PRIME> --sigma S [--param 0-3]` | ecm_group_order | alias `group-order`; `--param` (alias `--curve`) picks the GMP-ECM parametrization, see below |
-| `download <TABLE> <DIGITS> [--count 1..50000] [--random] [--terms] [-o FILE]` | download | one number per line; nothing at all when empty; `--terms` writes each number as its full stored term (a cofactor as `(parent)/factors`) instead of the export format |
+| `ecm-finds <ID>...` | ecm_finds | how prime factors were found, as recorded: method, B1/B2, sigma, date, submitter and the group order; at most 200 ids |
+| `report-ecm <ID> --method ecm\|edwards\|pm1\|pp1 [--param 0-3] [--sigma S] --b1 B1 [--b2 B2]` | report_ecm | write; records how a prime factor of 25 to 100 digits was found, after checking that its group order (or p-1 / p+1) is smooth within the bounds; credited to your account; a sigma written `P:S` (GMP-ECM's output) sets the parametrization |
+| `download <TABLE> <DIGITS> [--count 1..50000] [--random] [--terms] [--regular] [-o FILE]` | download | one number per line; nothing at all when empty; `--terms` writes each number as its full stored term (a cofactor as `(parent)/factors`) instead of the export format; `--regular` leaves out the open ends of sequences (factoring those only extends the sequence) |
 | `primo-batch <DIGITS> [--count 1..32000] [-o DIR [--parts N]]` | primo_batch | probable primes without a certificate, smallest first: listed, or with `-o` one Primo input file `primo_<id>.in` each; `--parts` spreads the files round-robin over subdirectories 1..N |
 | `login <USER> [-p PASS] [--no-save]` | login | prompts for the password (or reads stdin when piped); saves the token |
 | `register <USER> [--name N] [-p PASS] [--no-save]` | register | |
 | `whoami [--session TOKEN]` | whoami | |
 | `regenerate-token [--no-save]` | regenerate_token | see token rules |
 | `logout` | logout | also forgets the saved token |
+| `change-password` | change_password | prompts for the current and the new password (token required) |
 | `quota` | quota_status | alias `quota-status` |
 | `contributions [--skip] [--limit]` | contributions | your credited factors, newest first (token required); earned with `report --credit` / `seq advance --credit` or the website's "Credit my factors" setting |
 | `health` | health | |
