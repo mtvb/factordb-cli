@@ -745,6 +745,39 @@ enum SeqCmd {
         #[arg(long, value_name = "POS", requires = "to")]
         after: Option<String>,
     },
+    /// Download the open composites of sequences, one per line, smallest first [download_seq_ends]
+    ListDownload {
+        /// How many composites, at most 50000
+        #[arg(long, visible_alias = "count", default_value_t = 1000)]
+        limit: u64,
+        #[arg(long = "type", visible_alias = "sequence", default_value = "aliquot", help = TYPE_HELP, value_name = "TYPE", value_parser = parse_seq_type)]
+        kind: u8,
+        /// Start-value magnitude category: n = starts up to 10^(n+3), above the previous one
+        /// (0 = up to 1000, 1 = 1001 to 10000, 2 = 10001 to 100000, ...); default: all starts
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=63), conflicts_with = "to")]
+        category: Option<u8>,
+        /// Only sequences on this aliquot driver (0 none, 1 downdriver, 2-5 named, 6 perfect)
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=6), value_name = "CODE")]
+        driver: Option<u8>,
+        /// Only sequences whose frontier has exactly this guide value (finer than --driver)
+        #[arg(long, value_name = "GUIDE")]
+        guide: Option<u64>,
+        /// Every start up to this power of ten (10^3 to 10^66, written 10^6, 1e6 or 1000000)
+        #[arg(long, value_name = "BOUND", value_parser = parse_start_bound)]
+        to: Option<u8>,
+        /// Only composites with at least this many digits
+        #[arg(long, default_value_t = 60, value_name = "DIGITS")]
+        min_digits: u64,
+        /// Only composites with at most this many digits (0 = no limit)
+        #[arg(long, default_value_t = 0, value_name = "DIGITS")]
+        max_digits: u64,
+        /// A random sample of the selection instead of the smallest composites
+        #[arg(long)]
+        random: bool,
+        /// Write the composites to FILE instead of standard output
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
     /// Which sequences a number is a term of [sequence_of]
     Of {
         #[arg(help = TARGET_HELP)]
@@ -1833,6 +1866,55 @@ fn run_seq(ctx: &Ctx, sc: SeqCmd) -> Result<()> {
             ctx.simple("list_sequences", p)
         }
         SeqCmd::Of { target: t } => ctx.simple("sequence_of", json!({ "target": target(&t)? })),
+        SeqCmd::ListDownload { limit, kind, category, driver, guide, to, min_digits, max_digits, random, output } => {
+            if limit == 0 || limit > 50_000 {
+                return Err(Error::Usage(format!("--limit must be between 1 and 50000, got {limit}")));
+            }
+            let mut p = json!({ "type": kind, "count": limit, "min_digits": min_digits, "max_digits": max_digits, "random": random });
+            // the start range as bounds: one category, or every start up to 10^k (10^66 = all of them)
+            let (start_min, start_max) = match (category, to) {
+                (Some(n), _) => category_bounds(n),
+                (None, Some(max_category)) if max_category < 63 => (None, Some(format!("10^{}", u32::from(max_category) + 3))),
+                _ => (None, None),
+            };
+            if let Some(a) = start_min {
+                p["start_min"] = Value::String(a);
+            }
+            if let Some(b) = start_max {
+                p["start_max"] = Value::String(b);
+            }
+            if let Some(d) = driver {
+                p["driver"] = json!(d);
+            }
+            if let Some(g) = guide {
+                p["guide"] = json!(g);
+            }
+            let v = ctx.client.call("download_seq_ends", p)?;
+            // the server reads at most a fixed number of sequences per request; say so (stderr, the numbers stay clean)
+            let limited = if v.get("limited").and_then(Value::as_bool).unwrap_or(false) {
+                ", the server's read limit ended the selection early (narrow it for the rest)"
+            } else {
+                ""
+            };
+            let count = v.get("count").and_then(Value::as_u64).unwrap_or(0);
+            match output {
+                Some(path) => {
+                    let mut text = if ctx.json { render::pretty(&v) } else { render::render("download_seq_ends", &v) };
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    std::fs::write(&path, text)?;
+                    ctx.status(format!("{count} composites written to {}{limited}", path.display()));
+                }
+                None => {
+                    ctx.print("download_seq_ends", &v);
+                    if !ctx.json && !limited.is_empty() {
+                        eprintln!("{count} composites{limited}");
+                    }
+                }
+            }
+            Ok(())
+        }
         SeqCmd::Advance { start, kind, threads, from, to, terms, max_digits, ecm, heartbeat, no_submit, credit } => {
             let start_label = start.clone();
             let start = resolve_start(ctx, &start)?;
@@ -2357,6 +2439,20 @@ fn parse_start_bound(input: &str) -> std::result::Result<u8, String> {
     match k {
         Some(k @ 3..=66) => Ok((k - 3) as u8),
         _ => Err(format!("{input:?} is not a power of ten from 10^3 to 10^66 (e.g. 10^6, 1e6 or 1000000)")),
+    }
+}
+
+/// The start bounds of one start category for `download_seq_ends`: category n holds the starts in
+/// (10^(n+2), 10^(n+3)] (0: up to 1000; 63: everything above 10^65). Starts up to 10^18 are exact
+/// numbers; above, the server takes only powers of ten, so the lower bound 10^(n+2) also admits that
+/// single start itself (one value of the category below).
+fn category_bounds(n: u8) -> (Option<String>, Option<String>) {
+    let n = u32::from(n);
+    match n {
+        0 => (None, Some("1000".into())),
+        1..=15 => (Some(format!("1{}1", "0".repeat(n as usize + 1))), Some(format!("10^{}", n + 3))),
+        16..=62 => (Some(format!("10^{}", n + 2)), Some(format!("10^{}", n + 3))),
+        _ => (Some("10^65".into()), None),
     }
 }
 

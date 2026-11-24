@@ -57,7 +57,7 @@ pub fn render(method: &str, v: &Value) -> String {
         "report_ecm" => r_report_ecm(&mut o, v),
         "worker_queue" => r_worker_queue(&mut o, v),
         "ecm_group_order" => r_group_order(&mut o, v),
-        "download" => r_download(&mut o, v),
+        "download" | "download_seq_ends" => r_download(&mut o, v),
         "primo_batch" => r_primo_batch(&mut o, v),
         "login" | "register" | "regenerate_token" => r_session(&mut o, v),
         "whoami" => r_whoami(&mut o, v),
