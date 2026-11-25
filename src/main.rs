@@ -495,6 +495,9 @@ enum Cmd {
         /// Only regular numbers: leave out the open ends of sequences and read on past them
         #[arg(long)]
         regular: bool,
+        /// Each number as its decimal value, whatever form it is stored in
+        #[arg(long, conflicts_with = "terms")]
+        decimal: bool,
         /// Write the numbers to FILE instead of stdout
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
@@ -1384,7 +1387,7 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Download { table, digits, count, random, terms, regular, output } => {
+        Cmd::Download { table, digits, count, random, terms, regular, decimal, output } => {
             let table = table_name(&table, &["C", "CF", "PRP", "U", "P"])?;
             if count == 0 || count > 50_000 {
                 return Err(Error::Usage(format!("--count must be between 1 and 50000, got {count}")));
@@ -1395,6 +1398,9 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
             }
             if regular {
                 p["regular"] = json!(true);
+            }
+            if decimal {
+                p["decimal"] = json!(true);
             }
             let v = ctx.client.call("download", p)?;
             // with --regular: how many open sequence ends were left out (stderr, the numbers stay clean)
