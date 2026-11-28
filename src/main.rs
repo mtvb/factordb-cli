@@ -34,8 +34,9 @@ Settings resolve in this order: flag > environment > config file > default.
   config    $FDB_CONFIG or ~/.config/fdb/config.toml
 
 Without --timeout, reads give up after 120 s; writes (report, report-file, prove, check-factors,
-proof-progress, prp-test, seq view/extend/advance, cert upload, id --create, call, batch) wait for
-the server, which finishes the work either way.
+proof-progress, prp-test, seq view/extend/advance, cert upload, id --create, call, batch) wait up to
+10 minutes for the server's answer (it finishes the work either way); report-file sends a batch
+that got no answer up to 3 times before it stops.
 
 Exit codes: 0 ok · 1 the call failed (RPC error, rejected login, nothing found) · 2 usage ·
 3 service unreachable / HTTP error · 4 rate limit or quota exhausted · 5 address blocked.";
@@ -1076,9 +1077,10 @@ fn run(cli: Cli, reference: &str) -> Result<()> {
     let cfg = config::load()?;
     let settings = resolve_settings(&cli, &cfg)?;
     let timeout = config::timeout_duration(settings.timeout);
-    // Long-running writes wait for the server unless the caller set an explicit timeout.
-    let long_timeout = if settings.timeout_source == Source::Flag { timeout } else { None };
-    let client = Client::new(settings.url.clone(), settings.token.clone(), timeout, long_timeout, cli.verbose);
+    let explicit = settings.timeout_source == Source::Flag;
+    let long_timeout = if explicit { timeout } else { None };
+    let answer_timeout = if explicit { None } else { Some(client::WRITE_ANSWER_TIMEOUT) };
+    let client = Client::new(settings.url.clone(), settings.token.clone(), timeout, long_timeout, answer_timeout, cli.verbose);
     let mut ctx = Ctx { client, json: cli.json || cli.compact, compact: cli.compact, cfg, settings };
 
     match cli.cmd.expect("checked above") {
@@ -2238,6 +2240,11 @@ fn parse_report_file(text: &str, from_line: usize) -> (Vec<BulkReport>, Vec<Stri
 /// lines are skipped with a warning. A number whose report fails is shown and counted, and the run
 /// continues; a failure of the whole round-trip (rate limit, block, transport) stops it and names
 /// the line to resume from.
+/// How often `report-file` sends a batch that got no answer before it stops, and the pause before
+/// the second try (the third waits twice as long).
+const REPORT_FILE_ATTEMPTS: u32 = 3;
+const REPORT_FILE_RETRY_SECS: u64 = 30;
+
 fn run_report_file(ctx: &Ctx, file: &PathBuf, credit: bool, batch: usize, from_line: usize, dry_run: bool) -> Result<()> {
     let text = read_input(file)?;
     let (reports, skipped) = parse_report_file(&text, from_line.max(1));
@@ -2292,7 +2299,20 @@ fn run_report_file(ctx: &Ctx, file: &PathBuf, credit: bool, batch: usize, from_l
                 Call { method: "report_factors".to_string(), params: p }
             })
             .collect();
-        let results = match ctx.client.batch(&calls) {
+        let mut attempt = 1;
+        let results = loop {
+            match ctx.client.batch(&calls) {
+                Ok(r) => break Ok(r),
+                Err(Error::Transport(why)) if attempt < REPORT_FILE_ATTEMPTS => {
+                    let wait = REPORT_FILE_RETRY_SECS * attempt as u64;
+                    eprintln!("fdb: line {}: no answer for the batch ({why}) - sending it again in {wait} s (attempt {} of {REPORT_FILE_ATTEMPTS})", chunk[0].line, attempt + 1);
+                    std::thread::sleep(std::time::Duration::from_secs(wait));
+                    attempt += 1;
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        let results = match results {
             Ok(r) => r,
             Err(e) => {
                 stopped = Some((e, chunk[0].line));

@@ -83,10 +83,21 @@ pub struct Client {
     /// Timeout for calls that do long server-side work (writes such as `prove`, `extend_sequence`,
     /// certificate uploads). A client that gives up early is misleading: the server still finishes.
     long_timeout: Option<Duration>,
+    answer_timeout: Option<Duration>,
 }
 
+/// [`Client`]'s `answer_timeout` for long calls without an explicit `--timeout`.
+pub const WRITE_ANSWER_TIMEOUT: Duration = Duration::from_secs(600);
+
 impl Client {
-    pub fn new(url: String, token: Option<String>, timeout: Option<Duration>, long_timeout: Option<Duration>, verbose: bool) -> Self {
+    pub fn new(
+        url: String,
+        token: Option<String>,
+        timeout: Option<Duration>,
+        long_timeout: Option<Duration>,
+        answer_timeout: Option<Duration>,
+        verbose: bool,
+    ) -> Self {
         let agent = ureq::Agent::config_builder()
             // Keep 4xx/5xx as responses so their bodies (the 429 quota message) can be read.
             .http_status_as_error(false)
@@ -94,7 +105,7 @@ impl Client {
             .user_agent(concat!("fdb-cli/", env!("CARGO_PKG_VERSION")))
             .build()
             .new_agent();
-        Client { agent, url, token, verbose, timeout, long_timeout }
+        Client { agent, url, token, verbose, timeout, long_timeout, answer_timeout }
     }
 
     pub fn token(&self) -> Option<&str> {
@@ -118,7 +129,7 @@ impl Client {
         if self.verbose {
             eprintln!("> GET {url}");
         }
-        let mut req = self.agent.get(&url).config().timeout_global(self.long_timeout).build();
+        let mut req = self.agent.get(&url).config().timeout_global(self.long_timeout).timeout_recv_response(self.answer_timeout).build();
         if let Some(t) = &self.token {
             if !t.is_empty() {
                 req = req.header("X-Fdb-User-Token", t);
@@ -173,11 +184,13 @@ impl Client {
         }
         let t0 = Instant::now();
         let timeout = if long { self.long_timeout } else { self.timeout };
+        let answer = if long { self.answer_timeout } else { None };
         let mut req = self
             .agent
             .post(&self.url)
             .config()
             .timeout_global(timeout)
+            .timeout_recv_response(answer)
             .build()
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");

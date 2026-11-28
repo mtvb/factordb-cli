@@ -18,7 +18,7 @@ Settings resolve as flag > environment > config file > default:
 |----------|-------------|---------------|-------------------------------------------|
 | endpoint | `--url`     | `FDB_RPC_URL` | `https://factordb.com/rpc:4059`           |
 | token    | `--token`   | `FDB_TOKEN`   | none (anonymous); `''` forces anonymous   |
-| timeout  | `--timeout` |               | reads 120 s, writes unlimited (see below) |
+| timeout  | `--timeout` |               | reads 120 s, writes 10 min for the answer (see below) |
 
 The config file is `$FDB_CONFIG`, else `$XDG_CONFIG_HOME/fdb/config.toml`, else
 `~/.config/fdb/config.toml`. `fdb login <user>` writes the account's API token there (written
@@ -40,8 +40,9 @@ always prints instead of saving. `logout` invalidates the token and removes it f
 **Timeouts.** `--timeout SECS` applies to every call (0 = none). Without it, read calls give up
 after 120 s while write calls (`report`, `report-file`, `report-ecm`, `prove`, `check-factors`, `prp-test`,
 `proof-progress`, `seq extend`, `seq view`, `seq advance`, `cert upload`, `change-password`,
-`id --create`, `call`, `batch`) wait for the server, which finishes the work either way. A saved `timeout` in the config
-file is validated: only finite values from 0 up.
+`id --create`, `call`, `batch`) wait up to 10 minutes for the server's answer, which finishes the work either way
+(a lost reply no longer stalls them); `report-file` sends a batch that got no answer up to 3 times before it stops.
+A saved `timeout` in the config file is validated: only finite values from 0 up.
 
 ## Addressing numbers
 
